@@ -30,6 +30,25 @@ description: 在一台已登录 Claude Max 的机器上安装、配置、验证�
 - **SDK 隔离运行**：不加载内置工具、本机配置和 skill，不保存会话，不发标题生成、遥测这类附带请求。一次请求只对应一次上游调用，一句"你好"大约 700 tokens。原版一句话就有 1.7 万 tokens，还会把服务器的工具和环境信息带进上下文。
 - 请求里带服务端工具（`web_search_2025…` 之类）时，仍走原版的多轮路径（`handleWithTools`），由服务器上的内置工具执行。
 
+### 不带第三方指纹（上游只看到官方的东西）
+
+原则是：不管请求来自哪个客户端，发给 Anthropic 的请求在身份、系统提示、工具定义、消息格式上都和官方 CLI 自己发的一样。
+
+| 项目 | 做法 |
+|---|---|
+| 请求头、User-Agent、metadata | 一律不转发。上游的身份是官方 Agent SDK：`claude-cli/<ver> (external, sdk-cli, agent-sdk/<ver>)` |
+| 系统提示 | `SYSTEM_PROMPT_MODE=official`（默认）：使用 CLI 自带的 Claude Code 预设（`excludeDynamicSections`）。客户端的系统提示如果本身就是 Claude Code 官方提示，直接丢掉；如果是第三方的（比如 Cherry 的助手设定），放进第一条用户消息里的 `<system-reminder>`，和官方带 CLAUDE.md 的方式一样。设 `CLIENT_SYSTEM=drop` 则第三方系统提示完全不带 |
+| 工具定义 | 和 CLI 内置工具同名的（Bash/Read/Edit/Write/Glob/Grep/WebFetch…）启用 CLI **自己的官方定义**；CLI 在这种模式下加载不了的（如 Agent、PowerShell）直接不带，不改名转发。客户端自己的 MCP 工具保持原名 `mcp__<server>__<tool>`；其他名字的工具放在 `mcp__local__`（`BRIDGE_MCP_SERVER` 可改）下面 |
+| 工具执行 | PreToolUse 钩子一律拒绝，**任何工具都不在服务器上执行**。工具调用从事件流里截下来交给客户端 |
+| 消息格式 | 最后一条是普通用户消息时（每轮聊天、Claude Code 每次新提问），走"原生模式"：用 `sessionStore` + `resume` 把历史交给 CLI，上游看到的是真正的多轮 user/assistant/tool_use/tool_result 消息。最后一条带 tool_result 时（Claude Code 的工具循环），CLI 没法从半路接着跑（恢复时会插入"中断"或 "No response requested." 标记），这时退回"转录模式"：历史拼成按消息分块的文本，说明文字放在 reminder 里，不放在系统提示里。原生模式出错时也自动退回转录模式 |
+| 服务器自己的东西 | 自动记忆和组织记忆关闭（`CLAUDE_CODE_DISABLE_AUTO_MEMORY` / `CLAUDE_CODE_DISABLE_ORG_MEMORY`），不加载本机配置和 skill |
+
+剩下没法去掉的：对话内容本身，包括用户写的设定和客户端自定义工具的名字、描述，这些是功能需要的。CLI 自己附加的日期、模型名、账号邮箱提醒也会带上，这些是官方行为。
+
+原生模式的两个副作用（代码里已处理）：
+- SDK 恢复会话时会把凭证复制到临时目录 `claude-resume-*`，但**不带 refresh token**，所以这条路径自己不会续期登录令牌。每次原生请求前会检查令牌，剩不到 4.5 分钟就先发一个极小的普通请求让 CLI 续期。临时目录 15 分钟后自动清理。
+- `sessionStore` 不能和 `persistSession: false` 一起用，原生模式会把它打开，写入的是 SDK 的临时目录。
+
 其他要点：
 - 封号风险低：只走官方 SDK/CLI，不提取、不转发 OAuth 令牌，不伪装请求。上游看到的身份是 `claude-cli/<ver> (external, sdk-cli, agent-sdk/<ver>)`，也就是官方 Agent SDK。客户端（Cherry Studio 等）的请求头**不会转发**到上游。
 - 认证：**复用机器上现有的 `claude` 登录**（`~/.claude/.credentials.json`），不需要 `claude setup-token`，也不要设 `CLAUDE_CODE_OAUTH_TOKEN`。

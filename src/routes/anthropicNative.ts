@@ -1,20 +1,36 @@
 // Local patch: native /v1/messages handler for plain chat and client-side tools.
 //
-// Compared with the original paths in anthropic.ts:
-//  - History is sent as one SDK user message made of per-message content blocks
-//    (not one flattened string), so Anthropic's prompt cache matches the previous
-//    request's prefix and only the new turn is billed at full price.
-//  - Images / PDFs (in user messages and inside tool_result) are passed as real blocks.
-//  - The upstream Anthropic event stream is relayed as-is (real streaming, thinking
-//    deltas + signatures included); non-streaming responses are accumulated from it.
-//  - `thinking` / `output_config.effort` / `max_tokens` from the client are honoured.
-//  - The SDK runs isolated: no built-in tools, no settings, no persistence (see sdkBridge).
+// Goal: the request the official CLI sends upstream should look like ordinary
+// official traffic, carrying as little client-specific scaffolding as possible.
+//  - Tools whose names are CLI built-ins (Bash, Read, Edit, ...) are enabled as the
+//    CLI's OWN official definitions; other client tools keep their own names
+//    (mcp__server__tool stays as is). A PreToolUse hook denies every call, so nothing
+//    runs on this server - the tool_use is captured from the stream and returned.
+//  - "native" mode: the conversation so far is handed to the CLI as a real session
+//    (sessionStore + resume), so upstream sees genuine multi-turn messages with
+//    tool_use / tool_result / thinking blocks. Used whenever the last message is a
+//    user turn without tool_result (every chat turn, every new Claude Code prompt).
+//  - "transcript" mode: when the last message carries tool_result, the CLI cannot
+//    resume mid-turn (it inserts "interrupted"/"No response requested." markers), so
+//    history is sent as per-message text blocks instead. Also the fallback if native fails.
+//  - Images / PDFs pass as real blocks; the upstream event stream is relayed as-is;
+//    thinking / effort / max_tokens follow the client.
 import type { Request, Response } from "express";
-import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  tool,
+  createSdkMcpServer,
+  type SDKUserMessage,
+  type HookCallbackMatcher,
+  type HookEvent,
+} from "@anthropic-ai/claude-agent-sdk";
+import { randomUUID } from "crypto";
+import { existsSync, readFileSync, readdirSync, rmSync, statSync } from "fs";
+import { homedir, tmpdir } from "os";
+import { join } from "path";
 import { trackedQuery } from "../services/sdkBridge.js";
 import { cancelTask } from "../services/taskTracker.js";
 import { classifyUpstreamError } from "../services/errorClassifier.js";
-import { buildToolBridge } from "../services/toolBridge.js";
+import { jsonSchemaToZodShape, sanitizeToolName } from "../services/toolBridge.js";
 import type { ClientTool } from "../types/toolBridge.js";
 
 type Block = { type?: string; [k: string]: unknown };
@@ -42,18 +58,103 @@ export interface NativeParams {
   sdkCwd: string;
 }
 
+const NATIVE_HISTORY = process.env.NATIVE_HISTORY !== "false";
+// "official" (default): upstream system prompt is the CLI's own Claude Code preset; the
+// client's system prompt is either dropped (if it is itself a Claude Code prompt) or moved
+// into a <system-reminder> in the first user message, the way Claude Code carries CLAUDE.md.
+// "client": legacy behaviour, client system prompt becomes the SDK system prompt.
+const SYSTEM_PROMPT_MODE = process.env.SYSTEM_PROMPT_MODE === "client" ? "client" : "official";
+// CLIENT_SYSTEM=drop discards third-party system prompts entirely (default: reminder).
+const CLIENT_SYSTEM = process.env.CLIENT_SYSTEM === "drop" ? "drop" : "reminder";
+const OFFICIAL_PRESET = { type: "preset", preset: "claude_code", excludeDynamicSections: true };
+const LOOKS_OFFICIAL = /You are Claude Code|Claude Agent SDK|Anthropic's official CLI/;
+// MCP server name for client tools that are neither built-ins nor mcp__-named.
+const BRIDGE_SERVER = sanitizeToolName(process.env.BRIDGE_MCP_SERVER || "local");
 const LABEL: Record<string, string> = { user: "User", assistant: "Assistant", system: "System" };
 // Keep only the most recent N images/documents from history (older ones become a placeholder).
 const MAX_MEDIA = parseInt(process.env.MAX_HISTORY_IMAGES || "8", 10);
+// CLI version that matches the bundled SDK (SDK 0.3.N ships CLI 2.1.N); stamped on transcript entries.
+const CLI_VERSION = (process.env.CLAUDE_AGENT_SDK_VERSION || "0.3.319").replace(/^0\.3\./, "2.1.");
 
-// Stable across requests so it stays inside the cached prefix.
+// Transcript mode only. Stable across requests so it stays inside the cached prefix.
 const TRANSCRIPT_NOTE =
   "The conversation so far is given to you as a transcript whose turns are labelled " +
   "[User], [Assistant] and [System]. Reply as the assistant to the latest turn. Do not prefix " +
   "your reply with a label. Lines like [called tool ...] and [tool result ...] record earlier tool " +
   "calls; to call a tool yourself, use the tool-use mechanism, never write such lines as text.";
 
-// ---------------- prompt construction ----------------
+// ---------------- tools: official built-ins + name-preserving MCP ----------------
+
+// CLI built-in tools that can be enabled by name, so upstream carries the CLI's own
+// official definition. A built-in the CLI does not load in this mode (seen in its init
+// message, e.g. Agent) is simply left out - never re-exposed under an MCP name.
+const KNOWN_BUILTINS = new Set([
+  "Agent", "Task", "Bash", "PowerShell", "BashOutput", "KillShell", "Edit", "MultiEdit", "Write",
+  "Read", "Glob", "Grep", "NotebookEdit", "WebFetch", "WebSearch", "TodoWrite", "ToolSearch",
+  "Skill", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+  "Monitor", "TaskStop", "TaskOutput", "ListAgents", "SendMessage", "ScheduleWakeup",
+  "CronCreate", "CronDelete", "CronList", "ReportFindings", "PushNotification", "RemoteTrigger", "LSP",
+]);
+const notBuiltin = new Set<string>();
+
+const MCP_NAME_RE = /^mcp__([A-Za-z0-9_-]+?)__(.+)$/;
+
+interface ToolPlan {
+  builtins: string[];
+  mcpServers: Record<string, ReturnType<typeof createSdkMcpServer>> | undefined;
+  toClient: Map<string, string>; // upstream name -> client name
+  toUpstream: Map<string, string>; // client name -> upstream name
+}
+
+function planTools(clientTools: ClientTool[]): ToolPlan {
+  const builtins: string[] = [];
+  const groups = new Map<string, ReturnType<typeof tool>[]>();
+  const toClient = new Map<string, string>();
+  const toUpstream = new Map<string, string>();
+  const handler = async () => ({ content: [{ type: "text" as const, text: "Executed by the client." }] });
+
+  for (const t of clientTools) {
+    if (KNOWN_BUILTINS.has(t.name)) {
+      if (!notBuiltin.has(t.name)) builtins.push(t.name);
+      continue;
+    }
+    const m = MCP_NAME_RE.exec(t.name);
+    const server = m ? m[1] : BRIDGE_SERVER;
+    const name = sanitizeToolName(m ? m[2] : t.name);
+    const upstream = `mcp__${server}__${name}`;
+    if (toClient.has(upstream)) throw new Error(`Tool name collision: '${t.name}' maps to '${upstream}' twice`);
+    toClient.set(upstream, t.name);
+    toUpstream.set(t.name, upstream);
+    if (!groups.has(server)) groups.set(server, []);
+    groups.get(server)!.push(tool(name, t.description ?? "", jsonSchemaToZodShape(t.input_schema), handler));
+  }
+
+  let mcpServers: ToolPlan["mcpServers"];
+  if (groups.size > 0) {
+    mcpServers = {};
+    for (const [server, tools] of groups) mcpServers[server] = createSdkMcpServer({ name: server, version: "1.0.0", tools });
+  }
+  return { builtins, mcpServers, toClient, toUpstream };
+}
+
+// Every tool call is denied before execution: the client runs it, never this server.
+const DENY_ALL_TOOLS: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
+  PreToolUse: [
+    {
+      hooks: [
+        async () => ({
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse" as const,
+            permissionDecision: "deny" as const,
+            permissionDecisionReason: "Executed by the client.",
+          },
+        }),
+      ],
+    },
+  ],
+};
+
+// ---------------- shared helpers ----------------
 
 function isMedia(b: Block): boolean {
   return (b.type === "image" || b.type === "document") && !!b.source && typeof b.source === "object";
@@ -68,79 +169,9 @@ function cleanMedia(b: Block): Block {
   return out; // drops client cache_control etc. (the CLI places its own breakpoints)
 }
 
-function countMedia(messages: Msg[]): number {
-  let n = 0;
-  for (const m of messages) {
-    if (!Array.isArray(m.content)) continue;
-    for (const b of m.content) {
-      if (isMedia(b)) n++;
-      if (b.type === "tool_result" && Array.isArray(b.content)) {
-        for (const c of b.content as Block[]) if (isMedia(c)) n++;
-      }
-    }
-  }
-  return n;
-}
-
-export function buildPromptBlocks(messages: Msg[]): Block[] {
-  // Single plain user message: send it untouched (best quality for simple chat).
-  if (messages.length === 1 && messages[0].role === "user") {
-    const c = messages[0].content;
-    if (typeof c === "string") return [{ type: "text", text: c }];
-  }
-
-  let skipMedia = Math.max(0, countMedia(messages) - MAX_MEDIA);
-  const blocks: Block[] = [];
-
-  for (const m of messages) {
-    let buf = `[${LABEL[m.role] ?? m.role}]: `;
-    const flush = () => {
-      if (buf.trim()) blocks.push({ type: "text", text: buf });
-      buf = "";
-    };
-    const media = (b: Block) => {
-      if (skipMedia > 0) {
-        skipMedia--;
-        buf += `[${b.type} omitted: older attachment]\n`;
-        return;
-      }
-      flush();
-      blocks.push(cleanMedia(b));
-    };
-
-    if (typeof m.content === "string") {
-      buf += m.content;
-    } else {
-      for (const b of m.content) {
-        switch (b.type) {
-          case "text":
-            buf += `${b.text as string}\n`;
-            break;
-          case "tool_use":
-            buf += `[called tool "${b.name as string}" (id=${b.id as string}) with input: ${JSON.stringify(b.input ?? {})}]\n`;
-            break;
-          case "tool_result": {
-            buf += `[${b.is_error ? "tool error" : "tool result"} (id=${b.tool_use_id as string})]: `;
-            if (typeof b.content === "string") buf += `${b.content}\n`;
-            else if (Array.isArray(b.content)) {
-              for (const c of b.content as Block[]) {
-                if (c.type === "text") buf += `${c.text as string}\n`;
-                else if (isMedia(c)) media(c);
-              }
-            } else buf += "\n";
-            break;
-          }
-          case "image":
-          case "document":
-            if (isMedia(b)) media(b);
-            break;
-          // thinking / redacted_thinking from earlier turns are dropped
-        }
-      }
-    }
-    flush();
-  }
-  return blocks;
+function textOf(c: Msg["content"]): string {
+  if (typeof c === "string") return c;
+  return c.filter((b) => b.type === "text").map((b) => b.text as string).join("\n");
 }
 
 function systemText(system: NativeBody["system"]): string | undefined {
@@ -148,6 +179,32 @@ function systemText(system: NativeBody["system"]): string | undefined {
   if (typeof system === "string") return system || undefined;
   const t = system.filter((b) => b.type === "text").map((b) => b.text as string).join("\n\n");
   return t || undefined;
+}
+
+/**
+ * The client's own "# Environment" section (cwd, platform, shell...), latest occurrence,
+ * from its system prompt, role:"system" turns or reminder text. The CLI always attaches
+ * THIS server's environment too; re-stating the client's one last, in the CLI's own
+ * "# Environment update" form, keeps the model working against the client's machine.
+ */
+function clientEnvironment(messages: Msg[], clientSystem?: string): string | null {
+  const texts: string[] = [];
+  if (clientSystem) texts.push(clientSystem);
+  for (const m of messages) {
+    if (typeof m.content === "string") texts.push(m.content);
+    else for (const b of m.content) if (b.type === "text" && typeof b.text === "string") texts.push(b.text);
+  }
+  for (let i = texts.length - 1; i >= 0; i--) {
+    const t = texts[i];
+    const k = t.lastIndexOf("# Environment");
+    if (k < 0 || !/working directory/i.test(t.slice(k, k + 600))) continue;
+    let sec = t.slice(k);
+    const next = sec.search(/\n#{1,2} (?!Environment)/);
+    if (next > 0) sec = sec.slice(0, next);
+    sec = sec.replace(/<\/system-reminder>[\s\S]*$/, "").replace(/^# Environment( update)?\s*/, "").trim();
+    if (sec) return sec;
+  }
+  return null;
 }
 
 function previewOf(messages: Msg[]): string {
@@ -185,6 +242,235 @@ function mapThinking(t: unknown, model: string, maxTokens?: number): SdkThinking
 function mapEffort(oc: unknown): string | undefined {
   const e = oc && typeof oc === "object" ? (oc as { effort?: unknown }).effort : undefined;
   return typeof e === "string" && ["low", "medium", "high", "xhigh", "max"].includes(e) ? e : undefined;
+}
+
+// ---------------- native mode: real session history ----------------
+
+interface NMsg {
+  role: "user" | "assistant";
+  content: Block[];
+}
+
+function cleanUserBlock(b: Block): Block | null {
+  if (b.type === "text") return b.text ? { type: "text", text: b.text } : null;
+  if (isMedia(b)) return cleanMedia(b);
+  if (b.type === "tool_result") {
+    const out: Block = { type: "tool_result", tool_use_id: b.tool_use_id };
+    if (b.is_error) out.is_error = true;
+    if (typeof b.content === "string") out.content = b.content;
+    else if (Array.isArray(b.content)) {
+      out.content = (b.content as Block[])
+        .map((c) => (c.type === "text" ? { type: "text", text: c.text } : isMedia(c) ? cleanMedia(c) : null))
+        .filter(Boolean);
+    }
+    return out;
+  }
+  return null;
+}
+
+function cleanAssistantBlock(b: Block, toUpstream: Map<string, string>): Block | null {
+  switch (b.type) {
+    case "text":
+      return b.text ? { type: "text", text: b.text } : null;
+    case "thinking":
+      return b.signature ? { type: "thinking", thinking: b.thinking ?? "", signature: b.signature } : null;
+    case "redacted_thinking":
+      return b.data ? { type: "redacted_thinking", data: b.data } : null;
+    case "tool_use":
+      return { type: "tool_use", id: b.id, name: toUpstream.get(b.name as string) ?? b.name, input: b.input ?? {} };
+    default:
+      return null;
+  }
+}
+
+/** Client messages -> strictly alternating user/assistant messages; system turns become reminders. */
+function normalize(messages: Msg[], toUpstream: Map<string, string>): NMsg[] | null {
+  const out: NMsg[] = [];
+  let pendingSystem: Block[] = [];
+  for (const m of messages) {
+    if (m.role === "system") {
+      const t = textOf(m.content);
+      if (t) pendingSystem.push({ type: "text", text: `<system-reminder>\n${t}\n</system-reminder>` });
+      continue;
+    }
+    if (m.role !== "user" && m.role !== "assistant") return null;
+    const raw: Block[] = typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content;
+    let blocks = raw
+      .map((b) => (m.role === "user" ? cleanUserBlock(b) : cleanAssistantBlock(b, toUpstream)))
+      .filter((b): b is Block => b !== null);
+    if (m.role === "user" && pendingSystem.length) {
+      // tool_result blocks must stay first in a user message
+      const results = blocks.filter((b) => b.type === "tool_result");
+      blocks = [...results, ...pendingSystem, ...blocks.filter((b) => b.type !== "tool_result")];
+      pendingSystem = [];
+    }
+    if (blocks.length === 0) continue;
+    const prev = out[out.length - 1];
+    if (prev && prev.role === m.role) prev.content.push(...blocks);
+    else out.push({ role: m.role, content: blocks });
+  }
+  if (pendingSystem.length) {
+    const last = out[out.length - 1];
+    if (!last || last.role !== "user") return null;
+    last.content.push(...pendingSystem);
+  }
+  if (out.length === 0 || out[0].role !== "user" || out[out.length - 1].role !== "user") return null;
+  return out;
+}
+
+/** Session-store entries for everything before the final user turn. */
+function buildEntries(history: NMsg[], sessionId: string, cwd: string, model: string): Record<string, unknown>[] {
+  const entries: Record<string, unknown>[] = [];
+  let parent: string | null = null;
+  const t0 = Date.now() - history.length * 1000;
+  history.forEach((m, i) => {
+    const uuid = randomUUID();
+    const base = {
+      parentUuid: parent, isSidechain: false, userType: "external", cwd, sessionId,
+      version: CLI_VERSION, type: m.role, uuid, timestamp: new Date(t0 + i * 1000).toISOString(),
+    };
+    if (m.role === "user") {
+      entries.push({ ...base, message: { role: "user", content: m.content } });
+    } else {
+      const hasToolUse = m.content.some((b) => b.type === "tool_use");
+      entries.push({
+        ...base,
+        requestId: `req_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        message: {
+          id: `msg_${randomUUID().replace(/-/g, "").slice(0, 24)}`, type: "message", role: "assistant", model,
+          content: m.content, stop_reason: hasToolUse ? "tool_use" : "end_turn", stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      });
+    }
+    parent = uuid;
+  });
+  return entries;
+}
+
+// The resume path copies credentials WITHOUT the refresh token, so it can never refresh
+// an expiring access token itself. Before a native request, if the token is close to
+// expiry, run one tiny ordinary request, which makes the CLI refresh it on disk.
+const CREDS_PATH = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), ".credentials.json");
+const REFRESH_MARGIN_MS = 4.5 * 60_000;
+let refreshing: Promise<void> | null = null;
+
+function tokenExpiresAt(): number | null {
+  try {
+    if (!existsSync(CREDS_PATH)) return null;
+    const c = JSON.parse(readFileSync(CREDS_PATH, "utf8")) as { claudeAiOauth?: { expiresAt?: number } };
+    return c.claudeAiOauth?.expiresAt ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function ensureFreshToken(cwd: string): Promise<void> {
+  const exp = tokenExpiresAt();
+  if (exp === null || exp - Date.now() > REFRESH_MARGIN_MS) return;
+  if (!refreshing) {
+    refreshing = (async () => {
+      try {
+        const { query } = await import("@anthropic-ai/claude-agent-sdk");
+        for await (const _ of query({
+          prompt: "hi",
+          options: {
+            model: "claude-haiku-4-5", maxTurns: 1, tools: [], settingSources: [], persistSession: false, cwd,
+            systemPrompt: "Reply with one word.", thinking: { type: "disabled" },
+            env: { ...(process.env as Record<string, string>), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8" },
+          },
+        })) { /* drain */ }
+        console.log("[native] token refresh call done; expires in",
+          Math.round(((tokenExpiresAt() ?? 0) - Date.now()) / 60000), "min");
+      } catch (e) {
+        console.error("[native] token refresh call failed:", (e as Error).message);
+      } finally {
+        refreshing = null;
+      }
+    })();
+  }
+  await refreshing;
+}
+
+// The SDK materializes resumed sessions (with a credentials copy) under tmp/claude-resume-*.
+// It removes them itself; this sweeps anything left behind by a crash.
+setInterval(() => {
+  try {
+    const dir = tmpdir();
+    for (const n of readdirSync(dir)) {
+      if (!n.startsWith("claude-resume-")) continue;
+      const p = join(dir, n);
+      if (Date.now() - statSync(p).mtimeMs > 15 * 60_000) rmSync(p, { recursive: true, force: true });
+    }
+  } catch { /* best effort */ }
+}, 10 * 60_000).unref();
+
+// ---------------- transcript mode: per-message text blocks ----------------
+
+function countMedia(messages: Msg[]): number {
+  let n = 0;
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      if (isMedia(b)) n++;
+      if (b.type === "tool_result" && Array.isArray(b.content)) {
+        for (const c of b.content as Block[]) if (isMedia(c)) n++;
+      }
+    }
+  }
+  return n;
+}
+
+export function buildTranscriptBlocks(messages: Msg[]): Block[] {
+  let skipMedia = Math.max(0, countMedia(messages) - MAX_MEDIA);
+  const blocks: Block[] = [];
+  for (const m of messages) {
+    let buf = `[${LABEL[m.role] ?? m.role}]: `;
+    const flush = () => {
+      if (buf.trim()) blocks.push({ type: "text", text: buf });
+      buf = "";
+    };
+    const media = (b: Block) => {
+      if (skipMedia > 0) {
+        skipMedia--;
+        buf += `[${b.type} omitted: older attachment]\n`;
+        return;
+      }
+      flush();
+      blocks.push(cleanMedia(b));
+    };
+    if (typeof m.content === "string") {
+      buf += m.content;
+    } else {
+      for (const b of m.content) {
+        switch (b.type) {
+          case "text":
+            buf += `${b.text as string}\n`;
+            break;
+          case "tool_use":
+            buf += `[called tool "${b.name as string}" (id=${b.id as string}) with input: ${JSON.stringify(b.input ?? {})}]\n`;
+            break;
+          case "tool_result": {
+            buf += `[${b.is_error ? "tool error" : "tool result"} (id=${b.tool_use_id as string})]: `;
+            if (typeof b.content === "string") buf += `${b.content}\n`;
+            else if (Array.isArray(b.content)) {
+              for (const c of b.content as Block[]) {
+                if (c.type === "text") buf += `${c.text as string}\n`;
+                else if (isMedia(c)) media(c);
+              }
+            } else buf += "\n";
+            break;
+          }
+          case "image":
+          case "document":
+            if (isMedia(b)) media(b);
+            break;
+        }
+      }
+    }
+    flush();
+  }
+  return blocks;
 }
 
 // ---------------- response accumulation ----------------
@@ -253,57 +539,29 @@ function errorPayload(err: unknown): Block {
 
 export async function handleNative(req: Request, res: Response, p: NativeParams): Promise<void> {
   const { body } = p;
-  const tools = body.tool_choice?.type === "none" ? [] : p.clientTools;
+  const clientTools = body.tool_choice?.type === "none" ? [] : p.clientTools;
 
-  let bridge: ReturnType<typeof buildToolBridge> | null = null;
+  let plan: ToolPlan;
   try {
-    bridge = tools.length > 0 ? buildToolBridge(tools) : null;
+    plan = planTools(clientTools);
   } catch (err) {
     res.status(400).json({ type: "error", error: { type: "invalid_request_error", message: (err as Error).message } });
     return;
   }
-  const nameMap = bridge?.mcpToClient ?? new Map<string, string>();
 
-  const content = buildPromptBlocks(body.messages);
-  const sysParts = [TRANSCRIPT_NOTE];
-  if (req.keySystemPrompt) sysParts.push(req.keySystemPrompt);
-  const cs = systemText(body.system);
-  if (cs) sysParts.push(cs);
-
+  const clientSystem = systemText(body.system);
   const extraEnv: Record<string, string> = {};
   if (typeof body.max_tokens === "number" && body.max_tokens > 0) {
     extraEnv.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(body.max_tokens);
   }
 
-  async function* input(): AsyncGenerator<SDKUserMessage> {
-    yield {
-      type: "user",
-      message: { role: "user", content },
-      parent_tool_use_id: null,
-      session_id: "",
-    } as unknown as SDKUserMessage;
-  }
-
-  const { generator } = trackedQuery({
-    completionId: p.messageId,
-    prompt: input(),
-    promptPreview: previewOf(body.messages),
-    requestedModel: p.requestedModel,
-    resolvedModel: p.resolvedModel,
-    isStreaming: p.stream,
-    apiKeyId: req.apiKeyId ?? null,
-    apiKeyName: req.apiKeyName ?? null,
-    includePartialMessages: true,
-    mcpServers: bridge?.mcpServers,
-    allowedTools: bridge?.allowedTools,
-    builtInTools: [],
-    systemPrompt: sysParts.join("\n\n"),
-    maxTurns: 1,
-    cwd: p.sdkCwd,
-    thinking: mapThinking(body.thinking, p.resolvedModel, body.max_tokens),
-    effort: mapEffort(body.output_config),
-    extraEnv,
-  });
+  // Pick the mode.
+  // Claude Code appends role:"system" turns after the user message; look past them.
+  const nonSystem = body.messages.filter((m) => m.role !== "system");
+  const last = nonSystem[nonSystem.length - 1];
+  const lastHasToolResult = Array.isArray(last?.content) && last.content.some((b) => b.type === "tool_result");
+  let native: NMsg[] | null = null;
+  if (NATIVE_HISTORY && last?.role === "user" && !lastHasToolResult) native = normalize(body.messages, plan.toUpstream);
 
   const acc: Acc = { blocks: [], partialJson: {}, stopReason: null, stopSequence: null, usage: {} };
   let started = false; // stream: message_start relayed
@@ -320,21 +578,112 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   const finishNonStream = () => {
     responded = true;
     res.json({
-      id: p.messageId,
-      type: "message",
-      role: "assistant",
-      model: p.resolvedModel,
+      id: p.messageId, type: "message", role: "assistant", model: p.resolvedModel,
       content: acc.blocks.filter(Boolean),
-      stop_reason: acc.stopReason ?? "end_turn",
-      stop_sequence: acc.stopSequence,
-      usage: acc.usage,
+      stop_reason: acc.stopReason ?? "end_turn", stop_sequence: acc.stopSequence, usage: acc.usage,
     });
   };
 
-  try {
+  async function run(mode: "native" | "transcript"): Promise<void> {
+    let content: Block[];
+    let systemPrompt: string | undefined;
+    const extraOptions: Record<string, unknown> = { hooks: DENY_ALL_TOOLS };
+
+    const sysParts: string[] = [];
+    if (req.keySystemPrompt) sysParts.push(req.keySystemPrompt);
+    if (clientSystem) sysParts.push(clientSystem);
+    // Official mode: what goes into the first user message instead of the system prompt.
+    // A Claude Code client's system prompt is official text already, and it carries the
+    // CLIENT's environment (cwd, OS, git); replacing it with this server's preset makes the
+    // model work against the server's paths. So: Claude Code prompt -> used as is;
+    // third-party prompt -> official preset + the prompt as a reminder.
+    const clientIsOfficial = !!clientSystem && LOOKS_OFFICIAL.test(clientSystem.slice(0, 400));
+    const reminders: string[] = [];
+    if (SYSTEM_PROMPT_MODE === "official") {
+      if (req.keySystemPrompt) reminders.push(req.keySystemPrompt);
+      if (clientSystem && !clientIsOfficial && CLIENT_SYSTEM === "reminder") reminders.push(clientSystem);
+    }
+    const reminderBlocks = (extra: string[] = []): Block[] =>
+      [...extra, ...reminders].map((t) => ({ type: "text", text: `<system-reminder>\n${t}\n</system-reminder>` }));
+
+    if (mode === "native" && native) {
+      if (SYSTEM_PROMPT_MODE === "official" && reminders.length) {
+        native = [{ ...native[0], content: [...reminderBlocks(), ...native[0].content] }, ...native.slice(1)];
+      }
+      const history = native.slice(0, -1);
+      content = native[native.length - 1].content;
+      systemPrompt = sysParts.join("\n\n") || undefined;
+      if (history.length > 0) {
+        await ensureFreshToken(p.sdkCwd);
+        const sessionId = randomUUID();
+        const entries = buildEntries(history, sessionId, p.sdkCwd, p.resolvedModel);
+        extraOptions.resume = sessionId;
+        extraOptions.persistSession = true; // required by sessionStore; writes go to the SDK's temp resume dir
+        extraOptions.sessionStore = {
+          append: async () => {},
+          load: async (key: { sessionId: string }) => (key.sessionId === sessionId ? entries : null),
+        };
+      }
+    } else {
+      const single = body.messages.length === 1 && body.messages[0].role === "user";
+      content = single
+        ? (normalize(body.messages, plan.toUpstream)?.[0]?.content ?? buildTranscriptBlocks(body.messages))
+        : buildTranscriptBlocks(body.messages);
+      systemPrompt = (single ? sysParts : [TRANSCRIPT_NOTE, ...sysParts]).join("\n\n") || undefined;
+      if (SYSTEM_PROMPT_MODE === "official") content = [...reminderBlocks(single ? [] : [TRANSCRIPT_NOTE]), ...content];
+    }
+    // Claude Code clients: restate the client's environment last (see clientEnvironment).
+    if (clientIsOfficial) {
+      const env = clientEnvironment(body.messages, clientSystem);
+      if (env) content = [...content, { type: "text", text: `<system-reminder>\n# Environment update\n${env}\n</system-reminder>` }];
+    }
+    if (SYSTEM_PROMPT_MODE === "official") {
+      if (clientIsOfficial) {
+        systemPrompt = clientSystem;
+      } else {
+        systemPrompt = undefined;
+        extraOptions.systemPrompt = OFFICIAL_PRESET;
+      }
+    }
+
+    async function* input(): AsyncGenerator<SDKUserMessage> {
+      yield { type: "user", message: { role: "user", content }, parent_tool_use_id: null, session_id: "" } as unknown as SDKUserMessage;
+    }
+
+    const { generator } = trackedQuery({
+      completionId: p.messageId,
+      prompt: input(),
+      promptPreview: `[${mode}] ${previewOf(body.messages)}`,
+      requestedModel: p.requestedModel,
+      resolvedModel: p.resolvedModel,
+      isStreaming: p.stream,
+      apiKeyId: req.apiKeyId ?? null,
+      apiKeyName: req.apiKeyName ?? null,
+      includePartialMessages: true,
+      mcpServers: plan.mcpServers,
+      builtInTools: plan.builtins,
+      systemPrompt,
+      maxTurns: 1,
+      cwd: p.sdkCwd,
+      thinking: mapThinking(body.thinking, p.resolvedModel, body.max_tokens),
+      effort: mapEffort(body.output_config),
+      extraEnv,
+      extraOptions,
+    });
+
     for await (const m of generator) {
       if (clientGone) break;
       if (finished) continue; // drain the rest so the request log completes
+      if (m.type === "system" && (m as { subtype?: string }).subtype === "init") {
+        const loaded = new Set((m as { tools?: string[] }).tools ?? []);
+        for (const b of plan.builtins) {
+          if (!loaded.has(b) && !notBuiltin.has(b)) {
+            notBuiltin.add(b);
+            console.warn(`[native] CLI does not load built-in '${b}' here; it is left out from now on`);
+          }
+        }
+        continue;
+      }
       if (m.type !== "stream_event" || m.parent_tool_use_id) continue;
 
       const ev = { ...(m.event as Block) };
@@ -342,7 +691,7 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
         ev.message = { ...(ev.message as Block), id: p.messageId, model: p.resolvedModel };
       } else if (ev.type === "content_block_start" && (ev.content_block as Block)?.type === "tool_use") {
         const cb = { ...(ev.content_block as Block) };
-        cb.name = nameMap.get(cb.name as string) ?? cb.name;
+        cb.name = plan.toClient.get(cb.name as string) ?? cb.name;
         ev.content_block = cb;
       }
       accumulate(acc, ev);
@@ -369,32 +718,42 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
         }
       }
     }
-  } catch (err) {
-    // After message_stop the SDK typically throws error_max_turns (it tried to continue
-    // past our intercepted tool call). That is the normal path, not a failure.
-    if (!finished && !clientGone) {
-      console.error("[native] upstream error:", (err as Error)?.message);
-      responded = true;
-      if (started) {
-        sse(res, errorPayload(err));
-        res.end();
-      } else if (!res.headersSent) {
-        const c = classifyUpstreamError(err);
-        if (c.retryAfterSeconds !== undefined) res.setHeader("Retry-After", String(c.retryAfterSeconds));
-        res.status(c.status).json(errorPayload(err));
-      }
-      return;
-    }
   }
 
-  if (!finished && !clientGone && !responded) {
+  const fail = (err: unknown) => {
+    if (clientGone || responded) return;
+    console.error("[native] upstream error:", (err as Error)?.message);
     responded = true;
-    const err = new Error("Upstream ended without a complete message");
     if (started) {
       sse(res, errorPayload(err));
       res.end();
-    } else {
-      res.status(502).json({ type: "error", error: { type: "api_error", message: err.message } });
+    } else if (!res.headersSent) {
+      const c = classifyUpstreamError(err);
+      if (c.retryAfterSeconds !== undefined) res.setHeader("Retry-After", String(c.retryAfterSeconds));
+      res.status(c.status).json(errorPayload(err));
+    }
+  };
+
+  const firstMode = native ? "native" : "transcript";
+  try {
+    await run(firstMode);
+  } catch (err) {
+    // After message_stop the SDK typically throws error_max_turns (it tried to go past the
+    // intercepted tool call). That is the normal path, not a failure.
+    if (!finished) {
+      const nothingSent = !started && acc.blocks.length === 0;
+      if (firstMode === "native" && nothingSent && !clientGone) {
+        console.warn("[native] native mode failed before any output, retrying in transcript mode:", (err as Error)?.message);
+        try {
+          await run("transcript");
+        } catch (err2) {
+          if (!finished) fail(err2);
+        }
+      } else {
+        fail(err);
+      }
     }
   }
+
+  if (!finished && !clientGone && !responded) fail(new Error("Upstream ended without a complete message"));
 }

@@ -75,7 +75,7 @@ function jsonSchemaPropToZod(schema: unknown): ZodTypeAny {
   return z.any();
 }
 
-function jsonSchemaToZodShape(schema: ClientTool["input_schema"]): MutableZodShape {
+export function jsonSchemaToZodShape(schema: ClientTool["input_schema"]): MutableZodShape {
   if (!schema || typeof schema !== "object") return {};
   const props = schema.properties as Record<string, unknown> | undefined;
   const required = Array.isArray(schema.required) ? schema.required : [];
@@ -90,7 +90,7 @@ function jsonSchemaToZodShape(schema: ClientTool["input_schema"]): MutableZodSha
 
 // ---- Name sanitization: MCP tool names must match ^[a-zA-Z0-9_-]{1,64}$ ----
 
-function sanitizeToolName(name: string): string {
+export function sanitizeToolName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
 }
 

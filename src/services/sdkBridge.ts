@@ -35,6 +35,8 @@ interface TrackedQueryParams {
     | { type: "disabled" };
   effort?: string;
   extraEnv?: Record<string, string>;
+  // Local patch: raw SDK options merged last (hooks, resume, sessionStore, persistSession...).
+  extraOptions?: Record<string, unknown>;
 }
 
 // Local patch: env applied to every SDK subprocess. Skips the session-title call,
@@ -43,6 +45,9 @@ const QUIET_ENV: Record<string, string> = {
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
   DISABLE_TELEMETRY: "1",
   DISABLE_ERROR_REPORTING: "1",
+  // The official preset would otherwise attach this server's own auto-memory / org memory.
+  CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+  CLAUDE_CODE_DISABLE_ORG_MEMORY: "1",
 };
 
 interface TrackedQueryResult {
@@ -117,6 +122,8 @@ export function trackedQuery(params: TrackedQueryParams): TrackedQueryResult {
   } else {
     sdkOptions.env = { ...process.env, ...QUIET_ENV, ...(params.extraEnv ?? {}) };
   }
+
+  if (params.extraOptions) Object.assign(sdkOptions, params.extraOptions);
 
   const sdkQuery = query({
     prompt: params.prompt,
