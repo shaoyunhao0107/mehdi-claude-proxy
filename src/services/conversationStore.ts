@@ -193,6 +193,19 @@ export function conversationKey(metadata: unknown, agentId: string | undefined):
   return agentId && /^[A-Za-z0-9_-]{1,128}$/.test(agentId) ? `${sid}:agent:${agentId}` : sid;
 }
 
+/**
+ * Fallback identity for clients without a session id (WorkBuddy, Cherry, a gateway that
+ * drops metadata): the API key plus the conversation's first non-system message. Only a
+ * lookup key: continuing still requires the stored message prefix to match exactly, so
+ * two conversations that open identically merely cost each other a rebuild.
+ */
+export function fingerprintKey(apiKeyId: number | null | undefined, messages: Array<{ role: string; content: string | Block[] }>): string | null {
+  if (process.env.THIRD_PARTY_CONTINUITY === "false") return null;
+  const first = messages.find((m) => m.role !== "system");
+  if (!first) return null;
+  return `fp:${createHash("sha256").update(`${apiKeyId ?? "-"}|${messageHash(first)}`).digest("hex").slice(0, 32)}`;
+}
+
 type Block = { type?: string; [k: string]: unknown };
 
 function canonical(value: unknown): unknown {

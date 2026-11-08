@@ -171,6 +171,11 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
 ```
 
 分别用默认模型和 `ANTHROPIC_MODEL=claude-sonnet-4-6` 各跑一次。正常是 30–45 秒左右。
+
+一键回归（仓库里自带，改完代码都跑一遍）：
+- `scripts/e2e-two-prompts.sh <地址> <key> [模型] [--restart "<重启命令>"]`：本机真实 Claude Code 在同一会话里问两个问题，打印每个请求的缓存读写；加 `--restart` 时两问之间重启代理，第 2 问应该照样续接。
+- `python scripts/e2e-third-party.py <地址> <key> [模型]`：模拟 WorkBuddy 这类第三方 agent（自己的系统提示、自己的工具名、本机执行工具）。第 2 个请求起每轮应只写几十到几百 token。
+- 也可以把这两个脚本拷到另一台电脑上，经过它本地的网关（比如 Magpie）再测一遍真实链路。
 加上 `--output-format json` 可以看 `usage`：多轮任务里 `cache_read_input_tokens` 应该明显大于 `cache_creation_input_tokens`。如果 cache_read 接近 0，说明历史拆块或系统提示不稳定，提示缓存失效了。注意 `total_cost_usd` 在同一会话里是累计值，比较单个提问要看 token 数。
 
 额度参考（实测，Sonnet 5.5，同一会话两个提问；缓存写入 / 读取 token）：
@@ -211,6 +216,9 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
     - 遇到用量上限、限流时不重试，也保留会话。
     - 会话模式的请求用不上预热进程（预热时 resume 已经固定），预热只给兜底的转录模式用。
     - CLI 在这种模式下不加载的内置工具（Agent、PowerShell）按 CLI 版本记在 `data/not-builtin.json`。重启后不用重新学，否则每次重启后第一个对话的第二个请求，工具列表会变短，缓存整段失效。
+12. **第三方客户端也走会话模式**（WorkBuddy、Cherry、经过网关后丢了 metadata 的 Claude Code）：没有 session_id 时，用"API key + 第一条非 system 消息"的哈希当对话标识（`fingerprintKey`，`THIRD_PARTY_CONTINUITY=false` 可关）。这只是查找用的，续接仍然要求消息前缀完全一致，两段对话开头一样也只是互相多重建一次。第三方客户端自己的系统提示作为提醒块放在第一条消息开头，新建和重建会话时都会带上。实测（家里 → Magpie → 3457）后续每轮写缓存 0～205 token。
+13. **审计日志** `src/services/audit.ts`：每个请求一行 JSON 写进 `data/audit/<日期>.jsonl`，记录客户端的请求头（不含任何鉴权头）、用了哪个 key、模型、消息数、系统提示开头、工具名、走了哪种模式和会话、上游用的系统提示来源和工具、结果、耗时、缓存读写、错误（包括 "API Error: ... safeguards" 这类上游拒绝）。保留 `AUDIT_KEEP_DAYS`（默认 14）天，`AUDIT_LOG=false` 关闭。排错时在 `data/audit/` 下建一个空文件 `bodies.on`，之后每个请求的完整请求体会存到 `data/audit/bodies/`（不用重启），**用完马上删掉 `bodies.on` 和 `bodies/`**，里面有客户端的全部内容。
+14. **看门狗和清理**：一个请求超过 `REQUEST_IDLE_TIMEOUT_MS`（默认 5 分钟）没有任何 CLI 消息，就中断它、返回错误、释放名额；启动时把上次遗留的 `pending` 记录标成 interrupted；请求记录保留 `REQUEST_LOG_KEEP_DAYS`（默认 30）天，完整的提示和回复文本 `REQUEST_LOG_KEEP_TEXT_DAYS`（默认 7）天后清空；`start-public.ps1` 每次（重新）启动时，`proxy.log` 超过 20 MB 就轮换成 `proxy.log.1`。另外，会话续接的请求不再重复附加约 1 万字符的"环境更新"块（会话里第一次已经有了）。
 
 ## 同步上游更新
 
@@ -243,6 +251,8 @@ npm install && npm run build                       # Windows 记得先重新放�
 | 模型探测报 "memory allocation failed" | 有探测在并行跑，内存不够。确认 `refreshModels` 是串行的；也可能是同时进来的请求太多 |
 | 缓存写入一直很高，像每个请求都在重写历史 | 设 `DEBUG_SESSION_CONTINUITY=true` 看日志：大量 `rebuilding` 说明会话没接上，看是不是客户端每次都改动了历史；没有 `[session]` 行说明请求没走会话模式（客户端不是 Claude Code、没带 `metadata.user_id`、不是流式，或者 `SESSION_CONTINUITY=false`） |
 | 所有请求都卡住、日志里 `[concurrency] request waited ...s for a slot`，请求记录全是 pending | 先看日志开头有没有 `[config] ANTHROPIC_BASE_URL=... points at this proxy itself`：服务进程继承了指向自己的 `ANTHROPIC_BASE_URL`（比如在设置了客户端环境变量的终端里启动），CLI 子进程的请求打回代理自己，互相等。现在启动时会自动忽略这种配置；如果指向的是本机别的端口，要自己检查 |
+| 客户端报 `API Error: ... safeguards flagged this message`（`[cyber]`） | 这是 Anthropic 的内容安全分类器拦下了请求，不是代理的问题，直接用也一样。看审计日志里的 `apiErrorText`。常见原因是客户端上下文里带着大量安全类 MCP 工具和说明（比如逆向分析工具集），换个模型（如 Haiku）能过，根本办法是只在需要的会话里加载这类 MCP。注意被拦的请求同样会写缓存、扣额度 |
+| 第三方客户端（WorkBuddy 等）每轮都在重写几万 token | 看审计日志 `handling.session`：没有 session 说明没进会话模式（不是流式、没带工具）；每次都是 `rebuild` 说明客户端每轮都改了历史，用 `bodies.on` 抓两个请求对比 |
 | 上游请求里出现 "Executed by the client." | deny-hold 失效了（见补丁 11），并行工具调用的拒绝提前写进了会话 |
 | 日志里有 `[version] client Claude Code X differs` | 家里 Claude Code 和服务器 CLI 版本不同。把两边升到同一版本（服务器：`claude update` + `npm install @anthropic-ai/claude-agent-sdk@0.3.<N>`；客户端可以关自动更新固定版本） |
 | 日志里有 `[prewarm] claim refused` / `retrying cold` | 预热进程认领失败，已自动冷启动，不影响结果。频繁出现时看拒绝原因；可以 `PREWARM=false` 关掉 |

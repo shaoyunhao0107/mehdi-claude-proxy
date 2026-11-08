@@ -33,9 +33,10 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wri
 import { homedir, tmpdir } from "os";
 import { join } from "path";
 import { trackedQuery, type ClaimableSpare, type SdkOptionParams } from "../services/sdkBridge.js";
+import { auditFinish, auditStart, snippet } from "../services/audit.js";
 import { ensureSpare, prewarmEnabled, spareKey, takeSpare } from "../services/sparePool.js";
 import {
-  awaitTurn, beginTurn, CONTINUITY_ENABLED, conversationKey, dropTranscript, forget, getConversation, memorySessionStore,
+  awaitTurn, beginTurn, CONTINUITY_ENABLED, conversationKey, dropTranscript, fingerprintKey, forget, getConversation, memorySessionStore,
   messageHash, removeLocalTranscript, saveConversation, seedTranscript,
 } from "../services/conversationStore.js";
 import { cancelTask } from "../services/taskTracker.js";
@@ -649,6 +650,24 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   const { body } = p;
   checkClientVersion(req);
   const clientTools = body.tool_choice?.type === "none" ? [] : p.clientTools;
+  const t0 = Date.now();
+  const audit = auditStart(req, p.messageId, body as unknown as Record<string, unknown>);
+  if (audit) {
+    audit.request = {
+      model: p.requestedModel,
+      resolvedModel: p.resolvedModel,
+      stream: p.stream,
+      messages: body.messages.length,
+      lastRoles: body.messages.slice(-3).map((m) => m.role).join(","),
+      systemChars: systemText(body.system)?.length ?? 0,
+      systemStart: snippet(systemText(body.system), 120),
+      tools: clientTools.length,
+      toolNames: clientTools.map((t) => t.name).slice(0, 400),
+      thinking: body.thinking ?? null,
+      maxTokens: body.max_tokens ?? null,
+      hasSessionMetadata: !!(body.metadata as { user_id?: unknown } | undefined)?.user_id,
+    };
+  }
 
   let plan: ToolPlan;
   try {
@@ -686,16 +705,30 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   // Session continuity (see conversationStore): a Claude Code client's main loop (tools,
   // streamed; its tool-less side calls share the session id and stay stateless) keeps
   // one real CLI session across requests and sends only what is new.
+  // Claude Code is identified by its session id; other clients (WorkBuddy, Cherry, or a
+  // gateway that drops metadata) by a fingerprint of their first message.
   const convCandidate =
-    CONTINUITY_ENABLED && clientIsOfficial && clientTools.length > 0 && p.stream && last?.role === "user"
-      ? conversationKey(body.metadata, req.header("x-claude-code-agent-id") ?? undefined)
+    CONTINUITY_ENABLED && clientTools.length > 0 && p.stream && last?.role === "user"
+      ? (clientIsOfficial ? conversationKey(body.metadata, req.header("x-claude-code-agent-id") ?? undefined) : null)
+        ?? fingerprintKey(req.apiKeyId, body.messages)
       : null;
   // Wait for this conversation's previous request to save its state (see awaitTurn);
   // if it is still running after that, this request stays stateless.
   const convKey = convCandidate && (await awaitTurn(convCandidate, 30_000)) ? convCandidate : null;
   const endTurn = convKey ? beginTurn(convKey) : null;
   const msgHashes = convKey ? body.messages.map(messageHash) : [];
-  const session = convKey ? planSession(convKey, body.messages, msgHashes, plan.toUpstream, runCwd, p.resolvedModel) : null;
+  // What official mode puts at the start of the conversation instead of the system prompt:
+  // a third-party client's own prompt (and a per-key prompt) as reminders. A session holds
+  // it in its first message, so it goes in when the session is created or rebuilt.
+  const leadReminders: Block[] = SYSTEM_PROMPT_MODE !== "official" ? [] : [
+    ...(req.keySystemPrompt ? [req.keySystemPrompt] : []),
+    ...(clientSystem && !clientIsOfficial && CLIENT_SYSTEM === "reminder" ? [clientSystem] : []),
+  ].map((t) => ({ type: "text", text: `<system-reminder>
+${t}
+</system-reminder>` }));
+  const session = convKey
+    ? planSession(convKey, body.messages, msgHashes, plan.toUpstream, runCwd, p.resolvedModel, leadReminders)
+    : null;
   if (DEBUG_CONTINUITY && convCandidate) console.log(`[session] ${p.messageId.slice(-6)} key=${convCandidate.slice(0, 8)} waited-ok=${!!convKey} plan=${session?.kind ?? "none"} resume=${session?.sessionId?.slice(0, 8)} at=${session?.resumeAt?.slice(0, 8)} msgs=${body.messages.length}`);
 
   const acc: Acc = { blocks: [], partialJson: {}, stopReason: null, stopSequence: null, usage: {} };
@@ -764,7 +797,7 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
       // input (tool results resume at the tool-call entry, forking past the denial);
       // rebuild: a synthetic transcript of the client history, resumed the same way;
       // fresh: a new session.
-      content = session.kind === "fresh" ? [...reminderBlocks(), ...session.content] : session.content;
+      content = session.content; // planSession already put the lead reminders in
       systemPrompt = sysParts.join("\n\n") || undefined;
       extraOptions.persistSession = true;
       extraOptions.sessionStore = memorySessionStore;
@@ -803,8 +836,11 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
       if (SYSTEM_PROMPT_MODE === "official") content = [...reminderBlocks(single ? [] : [TRANSCRIPT_NOTE]), ...content];
     }
     // Claude Code client whose cwd could not be mirrored (e.g. a Mac client on this Windows
-    // server): restate the client's environment last instead (see clientEnvironment).
-    if (clientIsOfficial && clientEnv && runCwd === p.sdkCwd) {
+    // server, or a drive letter this server lacks): restate the client's environment last
+    // instead (see clientEnvironment). A continued session already holds it from its first
+    // request (~10k chars), so it is not repeated there.
+    const continuing = mode === "session" && session?.kind === "continue";
+    if (clientIsOfficial && clientEnv && runCwd === p.sdkCwd && !continuing) {
       content = [...content, { type: "text", text: `<system-reminder>\n# Environment update\n${clientEnv}\n</system-reminder>` }];
     }
     if (SYSTEM_PROMPT_MODE === "official") {
@@ -860,14 +896,29 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
       spare: spare ?? undefined,
     });
 
+    // Watchdog: a CLI that goes silent (hung resume, an upstream that never answers, a
+    // misconfiguration looping back into this proxy) must not hold a concurrency slot
+    // forever. No SDK message for REQUEST_IDLE_TIMEOUT_MS -> interrupt and fail.
+    let lastActivity = Date.now();
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastActivity < REQUEST_IDLE_TIMEOUT_MS) return;
+      clearInterval(watchdog);
+      console.warn(`[native] ${p.messageId}: no activity for ${Math.round(REQUEST_IDLE_TIMEOUT_MS / 1000)}s, aborting`);
+      cancelTask(p.messageId);
+      fail(new Error(`The upstream session went silent for ${Math.round(REQUEST_IDLE_TIMEOUT_MS / 1000)}s; request aborted`));
+      releaseDenies();
+    }, 5_000);
+    watchdog.unref();
     try {
       await consume();
     } finally {
+      clearInterval(watchdog);
       releaseDenies();
     }
 
     async function consume(): Promise<void> {
     for await (const m of generator) {
+      lastActivity = Date.now();
       if (clientGone) break;
       const sid = (m as { session_id?: string }).session_id;
       if (sid && (m.type === "system" || m.type === "result")) runSessionId = sid;
@@ -925,6 +976,7 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   }
 
   const fail = (err: unknown) => {
+    if (audit) audit.result.error = String((err as Error)?.message ?? err).slice(0, 400);
     if (clientGone || responded) return;
     console.error("[native] upstream error:", (err as Error)?.message);
     responded = true;
@@ -939,10 +991,47 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   };
 
   const firstMode = session ? "session" : native ? "native" : "transcript";
+  if (audit) {
+    audit.handling = {
+      client: clientIsOfficial ? "claude-code" : "third-party",
+      mode: firstMode,
+      session: session ? { kind: session.kind, fork: session.fork, key: convKey?.slice(0, 8) } : null,
+      cwd: runCwd === p.sdkCwd ? "server sdk-cwd" : "mirrored client cwd",
+    };
+    audit.upstream = {
+      systemPrompt: SYSTEM_PROMPT_MODE !== "official" ? "client (legacy mode)"
+        : clientIsOfficial ? "client Claude Code prompt as is" : "official claude_code preset",
+      clientPromptAsReminder: !clientIsOfficial && !!clientSystem && SYSTEM_PROMPT_MODE === "official" && CLIENT_SYSTEM === "reminder",
+      builtinTools: plan.builtins,
+      mcpTools: [...plan.toClient.keys()].slice(0, 400),
+      model: p.resolvedModel,
+    };
+  }
   try {
     await runAndRecord();
   } finally {
     endTurn?.();
+    if (audit) {
+      const u = acc.usage as Record<string, number | undefined>;
+      const text = acc.blocks.filter((b) => b?.type === "text").map((b) => String(b.text ?? "")).join("");
+      audit.result = {
+        ...audit.result,
+        ok: finished,
+        ms: Date.now() - t0,
+        stopReason: acc.stopReason,
+        toolCalls: acc.blocks.filter((b) => b?.type === "tool_use").map((b) => b.name),
+        usage: {
+          input: u.input_tokens, output: u.output_tokens,
+          cacheRead: u.cache_read_input_tokens, cacheWrite: u.cache_creation_input_tokens,
+        },
+        warmSpare: usedSpare || undefined,
+        fallback: usedFallback || undefined,
+        limited: limitedError || undefined,
+        textStart: snippet(text, 120),
+        apiErrorText: /^API Error:/.test(text) ? snippet(text, 300) : undefined,
+      };
+      auditFinish(audit);
+    }
   }
 
   async function runAndRecord(): Promise<void> {
@@ -1006,6 +1095,7 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
 // ---------------- session continuity planning ----------------
 
 const DEBUG_CONTINUITY = process.env.DEBUG_SESSION_CONTINUITY === "true";
+const REQUEST_IDLE_TIMEOUT_MS = Math.max(30_000, parseInt(process.env.REQUEST_IDLE_TIMEOUT_MS || "300000", 10));
 
 interface SessionPlan {
   kind: "fresh" | "continue" | "rebuild";
@@ -1031,6 +1121,7 @@ function planSession(
   toUpstream: Map<string, string>,
   cwd: string,
   model: string,
+  lead: Block[],
 ): SessionPlan | null {
   const st = getConversation(key);
   if (st) {
@@ -1061,7 +1152,8 @@ function planSession(
   if (!all) return null;
   const history = all.slice(0, -1);
   const content = all[all.length - 1].content;
-  if (history.length === 0) return { kind: "fresh", sessionId: randomUUID(), fork: false, content };
+  if (history.length === 0) return { kind: "fresh", sessionId: randomUUID(), fork: false, content: [...lead, ...content] };
+  if (lead.length) history[0] = { ...history[0], content: [...lead, ...history[0].content] };
   const seed = randomUUID();
   const entries = buildEntries(history, seed, cwd, model);
   seedTranscript(seed, entries as Array<{ type: string; [k: string]: unknown }>);

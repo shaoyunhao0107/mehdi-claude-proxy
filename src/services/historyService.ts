@@ -160,3 +160,23 @@ export function getStats(from?: string, to?: string): HistoryStats {
 
   return { ...totals, by_model: byModel, by_status: byStatus };
 }
+
+// Local patch: housekeeping. Requests still "pending" at startup were cut off by a restart;
+// old rows are removed, and the full prompt/response text is dropped earlier.
+export function markInterruptedRequests(): number {
+  return db.prepare(`
+    UPDATE request_log SET status = 'error',
+      error_message = COALESCE(error_message, 'interrupted: the proxy restarted'),
+      completed_at = datetime('now')
+    WHERE status = 'pending'
+  `).run().changes;
+}
+
+export function pruneHistory(keepDays: number, keepTextDays: number): { deleted: number; trimmed: number } {
+  const deleted = db.prepare(`DELETE FROM request_log WHERE created_at < datetime('now', ?)`).run(`-${keepDays} days`).changes;
+  const trimmed = db.prepare(`
+    UPDATE request_log SET full_prompt = NULL, full_response = NULL
+    WHERE created_at < datetime('now', ?) AND (full_prompt IS NOT NULL OR full_response IS NOT NULL)
+  `).run(`-${keepTextDays} days`).changes;
+  return { deleted, trimmed };
+}

@@ -16,6 +16,8 @@ $node = (Get-Command node -ErrorAction Stop).Source
 $log = "$root\proxy.log"
 
 while ($true) {
+    # Keep the log bounded: rotate to proxy.log.1 past 20 MB (one old copy is kept).
+    if ((Test-Path $log) -and (Get-Item $log).Length -gt 20MB) { Move-Item $log "$log.1" -Force }
     "[$(Get-Date -Format s)] starting proxy on port $Port" | Out-File $log -Append -Encoding unicode
     & $node dist/server.js *>> $log
     "[$(Get-Date -Format s)] proxy exited with code $LASTEXITCODE, restarting in 10s" | Out-File $log -Append -Encoding unicode
