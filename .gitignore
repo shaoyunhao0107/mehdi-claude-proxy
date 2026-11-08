@@ -19,8 +19,9 @@ data/
 *.sqlite
 *.sqlite3
 
-# Claude Code local settings (contains machine-specific paths, IPs)
-.claude/
+# Claude Code local settings (contains machine-specific paths, IPs) - but keep project skills
+.claude/*
+!.claude/skills/
 
 # OS files
 .DS_Store
@@ -37,3 +38,8 @@ Thumbs.db
 
 # SSH keys and other secrets
 secrets/
+
+# Local runtime secrets / logs
+.admin-secret
+.home-key
+proxy.log

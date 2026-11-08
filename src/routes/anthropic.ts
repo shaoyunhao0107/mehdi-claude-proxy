@@ -6,6 +6,9 @@ import { classifyUpstreamError } from "../services/errorClassifier.js";
 import { trackedQuery } from "../services/sdkBridge.js";
 import { cancelTask } from "../services/taskTracker.js";
 import { resolveModel } from "../models.js";
+import { resolve as resolvePath } from "path";
+const SDK_CWD = resolvePath(process.env.SDK_CWD || "./data/sdk-cwd");
+mkdirSync(SDK_CWD, { recursive: true });
 import {
   buildToolBridge,
   rewriteBlocksForClient,
@@ -43,7 +46,7 @@ type ContentBlock =
   | { type: string; [k: string]: unknown };
 
 interface AnthropicMessage {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   content: string | ContentBlock[];
 }
 
@@ -157,7 +160,7 @@ function buildPromptFromHistory(messages: AnthropicMessage[]): string {
   for (const msg of messages) {
     const content = msg.content;
     if (typeof content === "string") {
-      parts.push(`[${msg.role === "user" ? "User" : "Assistant"}]: ${content}`);
+      parts.push(`[${msg.role === "user" ? "User" : msg.role === "system" ? "System" : "Assistant"}]: ${content}`);
       continue;
     }
     if (!Array.isArray(content)) continue;
@@ -188,7 +191,7 @@ function buildPromptFromHistory(messages: AnthropicMessage[]): string {
       }
     }
     if (segments.length > 0) {
-      const role = msg.role === "user" ? "User" : "Assistant";
+      const role = msg.role === "user" ? "User" : msg.role === "system" ? "System" : "Assistant";
       parts.push(`[${role}]: ${segments.join("\n")}`);
     }
   }
@@ -264,6 +267,8 @@ function validateContentBlocks(
   }
   const allowedTypes = new Set([
     "text", "tool_use", "tool_result", "image", "document",
+    // Local patch: thinking blocks in history are accepted and dropped from the prompt.
+    "thinking", "redacted_thinking",
   ]);
   for (const block of content) {
     if (!block || typeof block !== "object") {
@@ -318,12 +323,9 @@ function validateRequest(body: AnthropicRequest): ValidationError | null {
     ];
   }
 
+  // Local patch: Claude Code always sends `thinking`; ignore it instead of rejecting.
   if (body.thinking !== undefined) {
-    return [
-      400,
-      "invalid_request_error",
-      "This proxy does not support extended thinking. Remove the 'thinking' field.",
-    ];
+    delete (body as { thinking?: unknown }).thinking;
   }
 
   // Validate system (only text blocks allowed)
@@ -349,7 +351,8 @@ function validateRequest(body: AnthropicRequest): ValidationError | null {
     if (!msg || typeof msg !== "object") {
       return [400, "invalid_request_error", `messages[${i}] must be an object`];
     }
-    if (msg.role !== "user" && msg.role !== "assistant") {
+    // Local patch: newer Claude Code sends mid-conversation role "system" messages.
+    if (msg.role !== "user" && msg.role !== "assistant" && msg.role !== "system") {
       return [
         400,
         "invalid_request_error",
@@ -559,6 +562,8 @@ async function handleWithTools(
     systemPrompt,
     maxTurns,
     permissionMode: hasServerTools ? "acceptEdits" : undefined,
+    // Local patch: run the SDK in an empty dir so the model doesn't see the proxy's own path.
+    cwd: SDK_CWD,
   });
 
   const capturedBlocks: OutputBlock[] = [];
@@ -613,8 +618,12 @@ async function handleWithTools(
       }
     }
   } catch (err: unknown) {
-    if (!res.headersSent) anthropicUpstreamError(res, err);
-    return;
+    // Local patch: newer Agent SDKs throw on error_max_turns once our intercepted
+    // tool_use ends the single turn. That is the expected path, not a failure.
+    if (!sawToolUse) {
+      if (!res.headersSent) anthropicUpstreamError(res, err);
+      return;
+    }
   }
 
   if (clientDisconnected) return;

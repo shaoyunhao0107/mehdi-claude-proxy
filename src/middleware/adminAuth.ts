@@ -1,7 +1,15 @@
 import type { Request, Response, NextFunction } from "express";
 import { ADMIN_API_SECRET } from "../config.js";
 
+const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+
 export function adminAuth(req: Request, res: Response, next: NextFunction): void {
+  // Local patch: the admin API is only reachable from this machine.
+  if (!LOOPBACK.has(req.socket.remoteAddress || "")) {
+    res.status(404).json({ error: { message: "Not found", type: "not_found" } });
+    return;
+  }
+
   if (!ADMIN_API_SECRET) {
     res.status(503).json({
       error: {

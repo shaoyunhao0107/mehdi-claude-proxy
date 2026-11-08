@@ -109,7 +109,7 @@ export function trackedQuery(params: TrackedQueryParams): TrackedQueryResult {
       isStreaming: params.isStreaming,
       requestLogId: logId,
     },
-    () => sdkQuery.interrupt()
+    async () => { await sdkQuery.interrupt(); }
   );
 
   // Wrap the generator to handle cleanup and capture full response
