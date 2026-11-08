@@ -147,8 +147,8 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
 ## 同步上游更新
 
 ```bash
-git remote add upstream https://github.com/MehdiMohseni82/claude-code-proxy.git   # 只需一次
-git fetch upstream && git merge upstream/main     # 冲突时以保留上面的本地补丁为准
+git remote add upstream https://github.com/MehdiMohseni82/claude-code-proxy.git   # 只需一次（新 clone 时）
+git fetch upstream && git merge upstream/master    # 冲突时以保留上面的本地补丁为准
 npm install && npm run build                       # Windows 记得先重新放行 better-sqlite3
 ```
 
