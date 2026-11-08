@@ -219,6 +219,9 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
 12. **第三方客户端也走会话模式**（WorkBuddy、Cherry、经过网关后丢了 metadata 的 Claude Code）：没有 session_id 时，用"API key + 第一条非 system 消息"的哈希当对话标识（`fingerprintKey`，`THIRD_PARTY_CONTINUITY=false` 可关）。这只是查找用的，续接仍然要求消息前缀完全一致，两段对话开头一样也只是互相多重建一次。第三方客户端自己的系统提示作为提醒块放在第一条消息开头，新建和重建会话时都会带上。实测（家里 → Magpie → 3457）后续每轮写缓存 0～205 token。
 13. **审计日志** `src/services/audit.ts`：每个请求一行 JSON 写进 `data/audit/<日期>.jsonl`，记录客户端的请求头（不含任何鉴权头）、用了哪个 key、模型、消息数、系统提示开头、工具名、走了哪种模式和会话、上游用的系统提示来源和工具、结果、耗时、缓存读写、错误（包括 "API Error: ... safeguards" 这类上游拒绝）。保留 `AUDIT_KEEP_DAYS`（默认 14）天，`AUDIT_LOG=false` 关闭。排错时在 `data/audit/` 下建一个空文件 `bodies.on`，之后每个请求的完整请求体会存到 `data/audit/bodies/`（不用重启），**用完马上删掉 `bodies.on` 和 `bodies/`**，里面有客户端的全部内容。
 14. **看门狗和清理**：一个请求超过 `REQUEST_IDLE_TIMEOUT_MS`（默认 5 分钟）没有任何 CLI 消息，就中断它、返回错误、释放名额；启动时把上次遗留的 `pending` 记录标成 interrupted；请求记录保留 `REQUEST_LOG_KEEP_DAYS`（默认 30）天，完整的提示和回复文本 `REQUEST_LOG_KEEP_TEXT_DAYS`（默认 7）天后清空；`start-public.ps1` 每次（重新）启动时，`proxy.log` 超过 20 MB 就轮换成 `proxy.log.1`。另外，会话续接的请求不再重复附加约 1 万字符的"环境更新"块（会话里第一次已经有了）。
+15. **子代理和 PowerShell**：CLI 的初始化消息里，Agent 工具用的是内部名字 `Task`（发给上游的仍是 `Agent`）。以前自动学习拿 `Agent` 去比，误判成"不加载"，把子代理从工具列表里删了；现在按 `TOOL_ALIASES` 里的别名比对。PowerShell 工具要设 `CLAUDE_CODE_USE_POWERSHELL_TOOL=1` 才加载，客户端带了 PowerShell 时代理会自动设。`data/not-builtin.json` 升级成 format 2，旧格式的文件会被忽略。子代理的请求带 `x-claude-code-agent-id`，有自己独立的会话（实测主对话调 Agent，子代理读文件交回结果，全程续接）。
+16. **撤回 / 编辑历史**：每个对话记一串检查点，记下处理到第几条消息、会话里对应哪条记录。客户端撤回或编辑后，只要历史和某个检查点之前的部分完全一致，就从那里用 `resumeSessionAt` 分叉，不整段重建（实测这次请求只写 68 token）。
+17. **SDK 版本跟进**：代理跑的是 SDK 自带的 CLI（`node_modules` 里 `claude-agent-sdk-win32-x64` 下的 `claude.exe`），**不是**服务器上装的 `claude`，所以服务器 `claude` 自动更新不影响代理。真正要跟的是客户端：家里 Claude Desktop 自带的 CLI 和各台电脑的 Claude Code 会自己升级，而客户端的系统提示是原样转发的。`src/services/sdkVersion.ts` 每天查一次 npm 上的最新 SDK，结果在 `GET /api/admin/status` 的 `sdk` 字段；客户端比服务器新时，日志里的 `[version]` 警告会提示升级。升级用 `scripts/update-sdk.ps1 [-Version x]`，它会依次停服务、装新版、编译、启动、用 `e2e-two-prompts.sh` 跑一遍（默认 Haiku），失败就自动装回旧版。**不做全自动升级**：新 CLI 可能改掉会话续接依赖的行为。升级成功后提交 package.json 和 package-lock.json。
 
 ## 同步上游更新
 
@@ -228,7 +231,7 @@ git fetch upstream && git merge upstream/master    # 冲突时以保留上面的
 npm install && npm run build                       # Windows 记得先重新放行 better-sqlite3
 ```
 
-升级本机 Claude Code 之后，把 SDK 也对齐：`npm install @anthropic-ai/claude-agent-sdk@0.3.<N>`。
+客户端（家里的 Claude Code / Claude Desktop）升级后，运行 `powershell -ExecutionPolicy Bypass -File scripts/update-sdk.ps1` 把 SDK 跟上，脚本自带回归测试和回滚（见补丁 17）。服务器自己装的 `claude` 和代理无关。
 改完重启服务（Windows：`Stop-ScheduledTask` 再 `Start-ScheduledTask`，或者直接结束 node 进程，循环会自动拉起），然后重跑"验证"。
 
 ## 排错
