@@ -98,6 +98,10 @@ def turn(messages, label):
 
 msgs = [{"role": "user", "content": "Read notes.txt and run the command hostname, then tell me the codename, the budget plus one, and the hostname."}]
 print("answer 1:", turn(msgs, "q1")[:200])
+after_q1 = list(msgs)
 msgs.append({"role": "user", "content": "Now multiply that budget by two using run_command with python -c, and tell me the result."})
 print("answer 2:", turn(msgs, "q2")[:200])
-print("expected: pelican, 4818,", socket.gethostname(), "; then 9634")
+# Rewind: drop question 2 and ask something else from the state after answer 1.
+rewound = after_q1 + [{"role": "user", "content": "Instead: what is the codename written in capital letters? Answer with just the word."}]
+print("answer 3 (after rewind):", turn(rewound, "q3")[:200])
+print("expected: pelican, 4818,", socket.gethostname(), "; then 9634; then PELICAN (q3 should resume, not rebuild)")

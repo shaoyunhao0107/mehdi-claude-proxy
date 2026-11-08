@@ -9,6 +9,7 @@ import { versionInfo } from "./anthropicNative.js";
 import { concurrencyStatus } from "../middleware/concurrency.js";
 import { spareStatus } from "../services/sparePool.js";
 import { continuityStatus } from "../services/conversationStore.js";
+import { sdkVersionStatus } from "../services/sdkVersion.js";
 
 const router = Router();
 
@@ -35,6 +36,7 @@ router.get("/status", (_req, res) => {
     concurrency: concurrencyStatus(),
     prewarm: spareStatus(),
     sessions: continuityStatus(),
+    sdk: sdkVersionStatus(),
     today: getStats(`${today} 00:00:00`),
   });
 });

@@ -42,6 +42,12 @@ export interface ConversationState {
   /** Set when the turn stopped at client tool calls: resume point and the awaited ids. */
   checkpointUuid?: string;
   pendingToolIds?: string[];
+  /**
+   * One per earlier turn: after the first `n` client messages, the reply ended at transcript
+   * entry `uuid` (awaiting `pending` tool results, if any). A client that rewinds to one of
+   * these points is resumed there with a fork instead of rebuilding the whole session.
+   */
+  checkpoints?: Array<{ n: number; uuid: string; pending?: string[] }>;
   lastUsed: number;
 }
 

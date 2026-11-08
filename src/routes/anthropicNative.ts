@@ -34,6 +34,7 @@ import { homedir, tmpdir } from "os";
 import { join } from "path";
 import { trackedQuery, type ClaimableSpare, type SdkOptionParams } from "../services/sdkBridge.js";
 import { auditFinish, auditStart, snippet } from "../services/audit.js";
+import { clientIsAhead } from "../services/sdkVersion.js";
 import { ensureSpare, prewarmEnabled, spareKey, takeSpare } from "../services/sparePool.js";
 import {
   awaitTurn, beginTurn, CONTINUITY_ENABLED, conversationKey, dropTranscript, fingerprintKey, forget, getConversation, memorySessionStore,
@@ -112,7 +113,8 @@ function checkClientVersion(req: Request): void {
     warnedClientVersions.add(m[1]);
     console.warn(
       `[version] client Claude Code ${m[1]} differs from this server's CLI ${CLI_VERSION}. ` +
-        `Its system prompt is forwarded as is, so keep both on the same version.`,
+        `Its system prompt is forwarded as is, so keep both on the same version` +
+        (clientIsAhead(m[1]) ? ` (the client is newer: run scripts/update-sdk.ps1).` : `.`),
     );
   }
 }
@@ -139,12 +141,14 @@ const KNOWN_BUILTINS = new Set([
 // Persisted across restarts: re-learning it costs the first conversation a cache miss
 // (the tool list, which leads the cached prefix, shrinks between its first two requests).
 const NOT_BUILTIN_PATH = join(process.cwd(), "data", "not-builtin.json");
+const TOOL_ALIASES: Array<[string, string]> = [["Agent", "Task"]];
 const notBuiltin = new Set<string>(loadNotBuiltin());
 function loadNotBuiltin(): string[] {
   try {
     const v = JSON.parse(readFileSync(NOT_BUILTIN_PATH, "utf8")) as { version?: string; tools?: string[] };
     // Learned per CLI version: a newer CLI may load these tools.
-    return v.version === CLI_VERSION && Array.isArray(v.tools) ? v.tools : [];
+    // format 2: learned with TOOL_ALIASES and the PowerShell switch (format 1 wrongly listed Agent/PowerShell).
+    return v.version === CLI_VERSION && (v as { format?: number }).format === 2 && Array.isArray(v.tools) ? v.tools : [];
   } catch {
     return [];
   }
@@ -152,7 +156,7 @@ function loadNotBuiltin(): string[] {
 function saveNotBuiltin(): void {
   try {
     mkdirSync(join(process.cwd(), "data"), { recursive: true });
-    writeFileSync(NOT_BUILTIN_PATH, JSON.stringify({ version: CLI_VERSION, tools: [...notBuiltin] }));
+    writeFileSync(NOT_BUILTIN_PATH, JSON.stringify({ format: 2, version: CLI_VERSION, tools: [...notBuiltin] }));
   } catch {
     /* best effort */
   }
@@ -686,6 +690,9 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   if (typeof body.max_tokens === "number" && body.max_tokens > 0) {
     extraEnv.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(body.max_tokens);
   }
+  // The CLI loads its PowerShell tool only with this switch (default off outside its
+  // interactive Windows setup); turn it on when the client offers PowerShell.
+  if (plan.builtins.includes("PowerShell")) extraEnv.CLAUDE_CODE_USE_POWERSHELL_TOOL = "1";
 
   // Pick the mode.
   // Claude Code appends role:"system" turns after the user message; look past them.
@@ -839,7 +846,7 @@ ${t}
     // server, or a drive letter this server lacks): restate the client's environment last
     // instead (see clientEnvironment). A continued session already holds it from its first
     // request (~10k chars), so it is not repeated there.
-    const continuing = mode === "session" && session?.kind === "continue";
+    const continuing = mode === "session" && (session?.kind === "continue" || session?.kind === "rewind");
     if (clientIsOfficial && clientEnv && runCwd === p.sdkCwd && !continuing) {
       content = [...content, { type: "text", text: `<system-reminder>\n# Environment update\n${clientEnv}\n</system-reminder>` }];
     }
@@ -928,6 +935,12 @@ ${t}
         const v = (m as { claude_code_version?: string }).claude_code_version;
         if (v && v !== CLI_VERSION) CLI_VERSION = v;
         const loaded = new Set((m as { tools?: string[] }).tools ?? []);
+        // The CLI reports some tools under their internal names: the Agent tool is
+        // "Task" in the init list (upstream it is still "Agent").
+        for (const [a, b] of TOOL_ALIASES) {
+          if (loaded.has(a)) loaded.add(b);
+          if (loaded.has(b)) loaded.add(a);
+        }
         for (const b of plan.builtins) {
           if (!loaded.has(b) && !notBuiltin.has(b)) {
             notBuiltin.add(b);
@@ -1072,12 +1085,19 @@ ${t}
   if (session && convKey && firstMode === "session") {
     if (finished && runSessionId && !usedFallback) {
       const toolIds = acc.blocks.filter((b) => b?.type === "tool_use").map((b) => b.id as string);
+      // Earlier turns that this request builds on stay valid rewind points.
+      const prev = getConversation(convKey);
+      const kept = session.basisN !== undefined ? (prev?.checkpoints ?? []).filter((c) => c.n <= session.basisN!) : [];
+      const checkpoints = lastAssistantUuid
+        ? [...kept, { n: msgHashes.length, uuid: lastAssistantUuid, pending: toolIds.length ? toolIds : undefined }].slice(-60)
+        : kept;
       // saveConversation also frees the session this one forked from.
       saveConversation(convKey, {
         sdkSessionId: runSessionId,
         msgHashes,
         checkpointUuid: toolIds.length ? lastAssistantUuid : undefined,
         pendingToolIds: toolIds.length ? toolIds : undefined,
+        checkpoints,
       });
       if (session.seededId && session.seededId !== runSessionId) dropTranscript(session.seededId);
       if (session.kind === "fresh") removeLocalTranscript(runSessionId);
@@ -1098,7 +1118,9 @@ const DEBUG_CONTINUITY = process.env.DEBUG_SESSION_CONTINUITY === "true";
 const REQUEST_IDLE_TIMEOUT_MS = Math.max(30_000, parseInt(process.env.REQUEST_IDLE_TIMEOUT_MS || "300000", 10));
 
 interface SessionPlan {
-  kind: "fresh" | "continue" | "rebuild";
+  kind: "fresh" | "continue" | "rewind" | "rebuild";
+  /** continue/rewind: how many client messages of the kept session this request builds on. */
+  basisN?: number;
   /** fresh: the id to create; continue/rebuild: the session to resume. */
   sessionId: string;
   resumeAt?: string;
@@ -1138,6 +1160,7 @@ function planSession(
         if (answersExactly) {
           return {
             kind: "continue",
+            basisN: n,
             sessionId: st.sdkSessionId,
             resumeAt: pending.length ? st.checkpointUuid : undefined,
             fork: pending.length > 0,
@@ -1145,6 +1168,25 @@ function planSession(
           };
         }
       }
+    }
+    // Rewind / edit: the history matches the kept session up to an earlier turn, then goes
+    // another way. Fork the session at that turn's reply instead of rebuilding it all.
+    for (const c of [...(st.checkpoints ?? [])].reverse()) {
+      if (c.n >= n || c.n + 1 >= messages.length) continue;
+      if (messages[c.n].role !== "assistant") continue;
+      let same = true;
+      for (let i = 0; i < c.n; i++) if (st.msgHashes[i] !== hashes[i]) { same = false; break; }
+      if (!same) continue;
+      const delta = normalize(messages.slice(c.n + 1), toUpstream);
+      if (!delta || delta.length !== 1) continue;
+      const results = delta[0].content.filter((b) => b.type === "tool_result").map((b) => b.tool_use_id as string);
+      const pending = c.pending ?? [];
+      const ok = pending.length
+        ? pending.length === results.length && pending.every((id) => results.includes(id))
+        : results.length === 0;
+      if (!ok) continue;
+      if (DEBUG_CONTINUITY) console.log(`[session] ${key.slice(0, 8)}: rewind to turn after ${c.n} message(s)`);
+      return { kind: "rewind", basisN: c.n, sessionId: st.sdkSessionId, resumeAt: c.uuid, fork: true, content: delta[0].content };
     }
     if (DEBUG_CONTINUITY) console.log(`[session] ${key.slice(0, 8)}: history does not extend the kept session, rebuilding`);
   }
