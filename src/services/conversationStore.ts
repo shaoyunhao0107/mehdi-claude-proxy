@@ -9,18 +9,30 @@
 // messages, with the CLI's per-turn environment in place, so the prompt cache extends
 // exactly as in a direct CLI session.
 //
-// Transcripts live in memory here (the SDK's sessionStore adapter), not in this
-// server's ~/.claude. Bounded by conversation count and idle time; a proxy restart only
-// costs one rebuild of each conversation from the client's history.
+// Storage (the SDK's sessionStore adapter, not this server's ~/.claude):
+//  - memory is the working cache (no disk read on the hot path);
+//  - every write also goes to SESSION_DIR (default data/sessions): one JSONL per CLI
+//    session plus conversations.json, so a proxy restart resumes the same sessions
+//    instead of rebuilding them from the client's history;
+//  - transcripts idle for MEMORY_IDLE_MINUTES leave memory but stay on disk (the
+//    upstream prompt cache is gone after an hour anyway); conversations idle for
+//    SESSION_IDLE_HOURS, or beyond SESSION_MAX_CONVERSATIONS, are deleted.
 import { createHash } from "crypto";
-import { existsSync, readdirSync, rmSync } from "fs";
+import {
+  appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync,
+} from "fs";
 import { homedir } from "os";
-import { join } from "path";
+import { join, resolve } from "path";
 import type { SessionStore, SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
 
 export const CONTINUITY_ENABLED = process.env.SESSION_CONTINUITY !== "false";
-const MAX_CONVERSATIONS = Math.max(1, parseInt(process.env.SESSION_MAX_CONVERSATIONS || "40", 10));
-const IDLE_MS = parseFloat(process.env.SESSION_IDLE_HOURS || "6") * 3600_000;
+const MAX_CONVERSATIONS = Math.max(1, parseInt(process.env.SESSION_MAX_CONVERSATIONS || "100", 10));
+const IDLE_MS = parseFloat(process.env.SESSION_IDLE_HOURS || "72") * 3600_000;
+const MEMORY_IDLE_MS = parseFloat(process.env.SESSION_MEMORY_IDLE_MINUTES || "60") * 60_000;
+const PERSIST = process.env.SESSION_PERSIST !== "false";
+const DIR = resolve(process.env.SESSION_DIR || "./data/sessions");
+const INDEX = join(DIR, "conversations.json");
+const SID_RE = /^[0-9a-f-]{16,64}$/i;
 
 export interface ConversationState {
   /** The CLI session that holds this conversation now (changes on every fork). */
@@ -33,29 +45,136 @@ export interface ConversationState {
   lastUsed: number;
 }
 
-const conversations = new Map<string, ConversationState>();
-const transcripts = new Map<string, SessionStoreEntry[]>();
+const conversations = new Map<string, ConversationState>(); // insertion order = LRU
+const transcripts = new Map<string, SessionStoreEntry[]>(); // memory cache
+
+// ---------------- disk ----------------
+
+const fileOf = (sid: string) => join(DIR, `${sid}.jsonl`);
+
+function diskWrite(fn: () => void): void {
+  if (!PERSIST) return;
+  try {
+    fn();
+  } catch (e) {
+    console.warn("[session] disk write failed (continuing in memory):", (e as Error).message);
+  }
+}
+
+function readTranscript(sid: string): SessionStoreEntry[] | null {
+  if (!PERSIST || !SID_RE.test(sid)) return null;
+  let text: string;
+  try {
+    text = readFileSync(fileOf(sid), "utf8");
+  } catch {
+    return null;
+  }
+  const out: SessionStoreEntry[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      out.push(JSON.parse(line) as SessionStoreEntry);
+    } catch {
+      /* a torn last line after a crash: skip it */
+    }
+  }
+  return out;
+}
+
+let indexTimer: NodeJS.Timeout | null = null;
+function saveIndexSoon(): void {
+  if (!PERSIST || indexTimer) return;
+  indexTimer = setTimeout(() => {
+    indexTimer = null;
+    diskWrite(() => {
+      const tmp = `${INDEX}.tmp`;
+      writeFileSync(tmp, JSON.stringify([...conversations.entries()]));
+      renameSync(tmp, INDEX);
+    });
+  }, 200);
+  indexTimer.unref?.();
+}
+
+function loadFromDisk(): void {
+  if (!PERSIST) return;
+  try {
+    mkdirSync(DIR, { recursive: true });
+  } catch {
+    return;
+  }
+  try {
+    const rows = JSON.parse(readFileSync(INDEX, "utf8")) as Array<[string, ConversationState]>;
+    const now = Date.now();
+    for (const [key, st] of rows) {
+      if (st && SID_RE.test(st.sdkSessionId) && now - st.lastUsed <= IDLE_MS && existsSync(fileOf(st.sdkSessionId))) {
+        conversations.set(key, st);
+      }
+    }
+  } catch {
+    /* no index yet */
+  }
+  // Remove transcripts nothing points at (rebuild seeds, sessions replaced by a fork).
+  const live = new Set([...conversations.values()].map((s) => s.sdkSessionId));
+  try {
+    for (const f of readdirSync(DIR)) {
+      const m = /^(.+)\.jsonl$/.exec(f);
+      if (m && !live.has(m[1])) rmSync(join(DIR, f), { force: true });
+    }
+  } catch {
+    /* ignore */
+  }
+  if (conversations.size) console.log(`[session] restored ${conversations.size} conversation(s) from ${DIR}`);
+}
+loadFromDisk();
+
+// Idle transcripts leave memory (they stay on disk and load again on demand).
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, st] of conversations) {
+    if (now - st.lastUsed > IDLE_MS) forget(key);
+    else if (PERSIST && now - st.lastUsed > MEMORY_IDLE_MS) transcripts.delete(st.sdkSessionId);
+  }
+}, 10 * 60_000).unref();
+
+// ---------------- the SDK's session store ----------------
 
 /** The SDK's transcript mirror: everything the CLI writes for our sessions lands here. */
 export const memorySessionStore: SessionStore = {
   async append(key, entries) {
-    const list = transcripts.get(key.sessionId) ?? [];
+    const sid = key.sessionId;
+    const list = transcripts.get(sid) ?? readTranscript(sid) ?? [];
     const seen = new Set(list.map((e) => e.uuid).filter(Boolean));
-    for (const e of entries) if (!e.uuid || !seen.has(e.uuid)) list.push(e);
-    transcripts.set(key.sessionId, list);
+    const added = entries.filter((e) => !e.uuid || !seen.has(e.uuid));
+    list.push(...added);
+    transcripts.set(sid, list);
+    if (added.length && SID_RE.test(sid)) {
+      diskWrite(() => appendFileSync(fileOf(sid), added.map((e) => JSON.stringify(e)).join("\n") + "\n"));
+    }
   },
   async load(key) {
-    return transcripts.get(key.sessionId) ?? null;
+    const sid = key.sessionId;
+    const cached = transcripts.get(sid);
+    if (cached) return cached;
+    const fromDisk = readTranscript(sid);
+    if (fromDisk) transcripts.set(sid, fromDisk);
+    return fromDisk;
   },
 };
 
 export function seedTranscript(sessionId: string, entries: SessionStoreEntry[]): void {
   transcripts.set(sessionId, entries);
+  if (SID_RE.test(sessionId)) {
+    diskWrite(() => writeFileSync(fileOf(sessionId), entries.map((e) => JSON.stringify(e)).join("\n") + "\n"));
+  }
 }
 
 export function dropTranscript(sessionId: string | undefined): void {
-  if (sessionId) transcripts.delete(sessionId);
+  if (!sessionId) return;
+  transcripts.delete(sessionId);
+  if (SID_RE.test(sessionId)) diskWrite(() => rmSync(fileOf(sessionId), { force: true }));
 }
+
+// ---------------- conversations ----------------
 
 /**
  * Conversation identity from Claude Code: metadata.user_id is a JSON string with the
@@ -70,7 +189,7 @@ export function conversationKey(metadata: unknown, agentId: string | undefined):
   } catch {
     return null;
   }
-  if (typeof sid !== "string" || !/^[0-9a-f-]{16,64}$/i.test(sid)) return null;
+  if (typeof sid !== "string" || !SID_RE.test(sid)) return null;
   return agentId && /^[A-Za-z0-9_-]{1,128}$/.test(agentId) ? `${sid}:agent:${agentId}` : sid;
 }
 
@@ -107,7 +226,7 @@ export function getConversation(key: string): ConversationState | undefined {
 export function forget(key: string): void {
   const s = conversations.get(key);
   if (s) dropTranscript(s.sdkSessionId);
-  conversations.delete(key);
+  if (conversations.delete(key)) saveIndexSoon();
 }
 
 /** Record the session that now holds the conversation; frees the one it replaced. */
@@ -120,6 +239,7 @@ export function saveConversation(key: string, next: Omit<ConversationState, "las
     const oldest = conversations.keys().next().value as string;
     forget(oldest);
   }
+  saveIndexSoon();
 }
 
 // One request per conversation at a time. The client sends its next request as soon as
@@ -175,10 +295,12 @@ export function continuityStatus() {
   for (const list of transcripts.values()) entries += list.length;
   return {
     enabled: CONTINUITY_ENABLED,
+    persisted: PERSIST ? DIR : false,
     conversations: conversations.size,
-    transcripts: transcripts.size,
-    entries,
+    transcriptsInMemory: transcripts.size,
+    entriesInMemory: entries,
     maxConversations: MAX_CONVERSATIONS,
     idleHours: IDLE_MS / 3600_000,
+    memoryIdleMinutes: MEMORY_IDLE_MS / 60_000,
   };
 }

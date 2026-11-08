@@ -207,7 +207,7 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
     - **deny-hold**：会话模式下 PreToolUse 钩子要等整段回复流完（看到 `message_stop`）才返回拒绝。否则并行工具调用时，第一个调用的拒绝会先写进会话、排在后面的调用前面，续接时会把 "Executed by the client." 当成工具结果发上去。
     - **同一对话的请求排队**：客户端执行完工具马上发下一个请求，可能早于上一个请求收尾保存状态；后一个最多等 30 秒，否则这一轮丢掉续接，下一个提问要整段重建。
     - 新开的会话（不是续接）还会在服务器 `~/.claude/projects/` 写一份 `.jsonl`，代理用完就删；续接和分叉的会话写在 SDK 的临时恢复目录，已有清理。
-    - 最多 `SESSION_MAX_CONVERSATIONS`（默认 40）个对话，闲置 `SESSION_IDLE_HOURS`（默认 6）小时清掉；每次分叉后释放旧会话。`DEBUG_SESSION_CONTINUITY=true` 会在日志里打每个请求走的是 fresh / continue / rebuild。
+    - **存储是内存加磁盘**：内存是工作缓存；每次写入同时追加到 `SESSION_DIR`（默认 `data/sessions/`，一个会话一个 `.jsonl`，加上索引 `conversations.json`）。代理重启后从磁盘恢复，同一个对话接着续接，不用重建；重启离上次使用不到 1 小时的话，上游缓存还能命中（实测重启后第 2 个提问写 2.4k、读 55k）。闲置 `SESSION_MEMORY_IDLE_MINUTES`（默认 60）分钟后只从内存里移走，文件留着，下次用时再读回来。闲置 `SESSION_IDLE_HOURS`（默认 72）小时、或超过 `SESSION_MAX_CONVERSATIONS`（默认 100）个对话时连文件一起删。每次分叉后删掉旧会话的文件，启动时清掉没人引用的文件。`SESSION_PERSIST=false` 只用内存。**这些文件里有你的代码和对话内容**，`data/` 已在 .gitignore 里，备份和分享服务器时注意。`DEBUG_SESSION_CONTINUITY=true` 会在日志里打每个请求走的是 fresh / continue / rebuild。
     - 遇到用量上限、限流时不重试，也保留会话。
     - 会话模式的请求用不上预热进程（预热时 resume 已经固定），预热只给兜底的转录模式用。
     - CLI 在这种模式下不加载的内置工具（Agent、PowerShell）按 CLI 版本记在 `data/not-builtin.json`。重启后不用重新学，否则每次重启后第一个对话的第二个请求，工具列表会变短，缓存整段失效。
@@ -242,6 +242,7 @@ npm install && npm run build                       # Windows 记得先重新放�
 | 模型列表缺了某个模型 | 先看 `GET /api/admin/models` 里对应 ID 的 `status`，再 `POST /api/admin/models/refresh?full=1` 重新探测。`error` 状态是临时失败（限流、网络），下次刷新会自动重试 |
 | 模型探测报 "memory allocation failed" | 有探测在并行跑，内存不够。确认 `refreshModels` 是串行的；也可能是同时进来的请求太多 |
 | 缓存写入一直很高，像每个请求都在重写历史 | 设 `DEBUG_SESSION_CONTINUITY=true` 看日志：大量 `rebuilding` 说明会话没接上，看是不是客户端每次都改动了历史；没有 `[session]` 行说明请求没走会话模式（客户端不是 Claude Code、没带 `metadata.user_id`、不是流式，或者 `SESSION_CONTINUITY=false`） |
+| 所有请求都卡住、日志里 `[concurrency] request waited ...s for a slot`，请求记录全是 pending | 先看日志开头有没有 `[config] ANTHROPIC_BASE_URL=... points at this proxy itself`：服务进程继承了指向自己的 `ANTHROPIC_BASE_URL`（比如在设置了客户端环境变量的终端里启动），CLI 子进程的请求打回代理自己，互相等。现在启动时会自动忽略这种配置；如果指向的是本机别的端口，要自己检查 |
 | 上游请求里出现 "Executed by the client." | deny-hold 失效了（见补丁 11），并行工具调用的拒绝提前写进了会话 |
 | 日志里有 `[version] client Claude Code X differs` | 家里 Claude Code 和服务器 CLI 版本不同。把两边升到同一版本（服务器：`claude update` + `npm install @anthropic-ai/claude-agent-sdk@0.3.<N>`；客户端可以关自动更新固定版本） |
 | 日志里有 `[prewarm] claim refused` / `retrying cold` | 预热进程认领失败，已自动冷启动，不影响结果。频繁出现时看拒绝原因；可以 `PREWARM=false` 关掉 |

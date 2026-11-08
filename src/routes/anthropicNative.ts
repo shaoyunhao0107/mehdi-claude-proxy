@@ -696,6 +696,7 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   const endTurn = convKey ? beginTurn(convKey) : null;
   const msgHashes = convKey ? body.messages.map(messageHash) : [];
   const session = convKey ? planSession(convKey, body.messages, msgHashes, plan.toUpstream, runCwd, p.resolvedModel) : null;
+  if (DEBUG_CONTINUITY && convCandidate) console.log(`[session] ${p.messageId.slice(-6)} key=${convCandidate.slice(0, 8)} waited-ok=${!!convKey} plan=${session?.kind ?? "none"} resume=${session?.sessionId?.slice(0, 8)} at=${session?.resumeAt?.slice(0, 8)} msgs=${body.messages.length}`);
 
   const acc: Acc = { blocks: [], partialJson: {}, stopReason: null, stopSequence: null, usage: {} };
   let started = false; // stream: message_start relayed
