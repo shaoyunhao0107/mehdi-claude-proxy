@@ -202,6 +202,7 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
 7. 新增 `src/services/sparePool.ts`：用 SDK 官方的 `prewarm()` 提前起好 CLI 进程。工具循环里的每个请求，选项（系统提示、工具、思考、effort、max_tokens）都一样，所以每个请求之后按同样的选项预热一个备用进程，下一个请求 `claim()` 它，只设 cwd 和 model，省掉 1–2 秒启动。最多 `PREWARM_MAX_SPARES`（默认 2）个，闲置 `PREWARM_IDLE_MINUTES`（默认 10）分钟后关掉，每个约 250 MB；`PREWARM=false` 关闭。认领失败时自动冷启动重试。注意：预热进程会加载本机账号的 claude.ai 连接器（如 Claude Docs），所以 `QUIET_ENV` 里加了 `ENABLE_CLAUDEAI_MCP_SERVERS=false`，**不能去掉**。cwd 不能是 8.3 短路径（如 `ADMINI~1`），否则认领被拒（`unsafe_path`）。`sdkBridge.ts` 相应拆出了 `buildSdkOptions()`。
 8. 新增 `src/middleware/concurrency.ts`：同时运行的模型请求最多 `MAX_CONCURRENT_REQUESTS`（默认 4）个，多的排队；排队中客户端断开就出队。
 9. 用量记录：`request_log` 加了 `cache_read_tokens` / `cache_write_tokens` 两列（从转发的事件流里取）。工具调用被截下后 SDK 报的 "maximum number of turns" 记为 success，不再记成 error。`GET /api/admin/status` 返回服务器 CLI 版本、见过的客户端版本、并发和预热状态、当天用量。
+10. 版本检查：客户端 User-Agent 里的 Claude Code 版本和服务器 CLI 版本不同时，日志打一条 `[version]` 警告。Claude Code 客户端的系统提示是原样转发的，版本不一致时提示文字和上游的版本号对不上，两边要一起升级。
 11. 新增 `src/services/conversationStore.ts` 和 `anthropicNative.ts` 里的会话模式（见原理一节"消息格式"）。要点：
     - **deny-hold**：会话模式下 PreToolUse 钩子要等整段回复流完（看到 `message_stop`）才返回拒绝。否则并行工具调用时，第一个调用的拒绝会先写进会话、排在后面的调用前面，续接时会把 "Executed by the client." 当成工具结果发上去。
     - **同一对话的请求排队**：客户端执行完工具马上发下一个请求，可能早于上一个请求收尾保存状态；后一个最多等 30 秒，否则这一轮丢掉续接，下一个提问要整段重建。
@@ -210,7 +211,6 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
     - 遇到用量上限、限流时不重试，也保留会话。
     - 会话模式的请求用不上预热进程（预热时 resume 已经固定），预热只给兜底的转录模式用。
     - CLI 在这种模式下不加载的内置工具（Agent、PowerShell）按 CLI 版本记在 `data/not-builtin.json`。重启后不用重新学，否则每次重启后第一个对话的第二个请求，工具列表会变短，缓存整段失效。
-10. 版本检查：客户端 User-Agent 里的 Claude Code 版本和服务器 CLI 版本不同时，日志打一条 `[version]` 警告。Claude Code 客户端的系统提示是原样转发的，版本不一致时提示文字和上游的版本号对不上，两边要一起升级。
 
 ## 同步上游更新
 
