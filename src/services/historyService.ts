@@ -31,6 +31,8 @@ export function completeRequest(
   data: {
     inputTokens?: number;
     outputTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
     totalCostUsd?: number;
     durationMs?: number;
     errorMessage?: string;
@@ -42,6 +44,8 @@ export function completeRequest(
     SET status = ?,
         input_tokens = ?,
         output_tokens = ?,
+        cache_read_tokens = ?,
+        cache_write_tokens = ?,
         total_cost_usd = ?,
         duration_ms = ?,
         error_message = ?,
@@ -52,6 +56,8 @@ export function completeRequest(
     status,
     data.inputTokens ?? 0,
     data.outputTokens ?? 0,
+    data.cacheReadTokens ?? 0,
+    data.cacheWriteTokens ?? 0,
     data.totalCostUsd ?? 0,
     data.durationMs ?? 0,
     data.errorMessage ?? null,
@@ -127,13 +133,17 @@ export function getStats(from?: string, to?: string): HistoryStats {
       COUNT(*) as total_requests,
       COALESCE(SUM(total_cost_usd), 0) as total_cost_usd,
       COALESCE(SUM(input_tokens), 0) as total_input_tokens,
-      COALESCE(SUM(output_tokens), 0) as total_output_tokens
+      COALESCE(SUM(output_tokens), 0) as total_output_tokens,
+      COALESCE(SUM(cache_read_tokens), 0) as total_cache_read_tokens,
+      COALESCE(SUM(cache_write_tokens), 0) as total_cache_write_tokens
     FROM request_log ${where}
   `).get(...values) as {
     total_requests: number;
     total_cost_usd: number;
     total_input_tokens: number;
     total_output_tokens: number;
+    total_cache_read_tokens: number;
+    total_cache_write_tokens: number;
   };
 
   const byModel = db.prepare(`

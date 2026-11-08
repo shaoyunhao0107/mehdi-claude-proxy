@@ -1,4 +1,4 @@
-import { query, type Query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKUserMessage, type SpareProcess } from "@anthropic-ai/claude-agent-sdk";
 import { registerTask, unregisterTask } from "./taskTracker.js";
 import { insertPendingRequest, completeRequest } from "./historyService.js";
 import { recordTokensForRateLimit } from "../middleware/rateLimiter.js";
@@ -8,16 +8,9 @@ import { attachUpstreamText } from "./errorClassifier.js";
 
 const STDERR_TAIL_CHARS = 4000;
 
-interface TrackedQueryParams {
-  completionId: string;
-  // A string, or an async iterable of SDKUserMessage (structured blocks / images).
-  prompt: string | AsyncIterable<SDKUserMessage>;
-  promptPreview?: string;
-  requestedModel: string;
+/** Everything that decides the CLI's options (and so which prewarmed spare fits). */
+export interface SdkOptionParams {
   resolvedModel: string;
-  isStreaming: boolean;
-  apiKeyId: number | null;
-  apiKeyName: string | null;
   includePartialMessages?: boolean;
   // Optional, for tool-use support on /v1/messages:
   mcpServers?: Record<string, unknown>;
@@ -39,6 +32,25 @@ interface TrackedQueryParams {
   extraOptions?: Record<string, unknown>;
 }
 
+/** A prewarmed CLI started with buildSdkOptions() of the same params (minus cwd/model). */
+export interface ClaimableSpare {
+  process: SpareProcess;
+  // The spare's stderr callback was fixed at prewarm time; it forwards here.
+  stderrSink: { fn?: (data: string) => void };
+}
+
+interface TrackedQueryParams extends SdkOptionParams {
+  completionId: string;
+  // A string, or an async iterable of SDKUserMessage (structured blocks / images).
+  prompt: string | AsyncIterable<SDKUserMessage>;
+  promptPreview?: string;
+  requestedModel: string;
+  isStreaming: boolean;
+  apiKeyId: number | null;
+  apiKeyName: string | null;
+  spare?: ClaimableSpare;
+}
+
 // Local patch: env applied to every SDK subprocess. Skips the session-title call,
 // the /api/hello probe and telemetry, so a request costs exactly one API call.
 const QUIET_ENV: Record<string, string> = {
@@ -48,6 +60,9 @@ const QUIET_ENV: Record<string, string> = {
   // The official preset would otherwise attach this server's own auto-memory / org memory.
   CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
   CLAUDE_CODE_DISABLE_ORG_MEMORY: "1",
+  // This server account's claude.ai connectors (e.g. Claude Docs) must not be loaded:
+  // a prewarmed CLI otherwise attaches their tools and instructions to every request.
+  ENABLE_CLAUDEAI_MCP_SERVERS: "false",
 };
 
 interface TrackedQueryResult {
@@ -55,37 +70,20 @@ interface TrackedQueryResult {
   queryHandle: Query;
 }
 
-export function trackedQuery(params: TrackedQueryParams): TrackedQueryResult {
-  const startTime = Date.now();
-
-  const promptStr = params.promptPreview ?? (typeof params.prompt === "string" ? params.prompt : "(multi-modal input)");
-
-  // Insert pending request log (with full prompt for detail view)
-  const logId = insertPendingRequest({
-    apiKeyId: params.apiKeyId,
-    completionId: params.completionId,
-    requestedModel: params.requestedModel,
-    resolvedModel: params.resolvedModel,
-    isStream: params.isStreaming,
-    promptPreview: promptStr.slice(0, 200),
-    fullPrompt: promptStr,
-  });
-
-  // Assemble SDK options. maxTurns defaults to 1 (existing contract); callers
-  // may override. settingSources: [] is set unconditionally so Claude Code
-  // doesn't load CLAUDE.md or user settings that could leak instructions.
+/**
+ * SDK options for a request (everything except the stderr callback). Exported so the
+ * prewarm pool starts spare processes with exactly the options a cold query would use.
+ */
+export function buildSdkOptions(params: SdkOptionParams): Record<string, unknown> {
+  // maxTurns defaults to 1 (existing contract); callers may override. settingSources: []
+  // is set unconditionally so Claude Code doesn't load CLAUDE.md or user settings that
+  // could leak instructions.
   const sdkOptions: Record<string, unknown> = {
     model: params.resolvedModel,
     maxTurns: params.maxTurns ?? 1,
     settingSources: [],
     // Local patch: never write session transcripts for proxied requests.
     persistSession: false,
-  };
-  // Capture the CLI's stderr so failures are logged with the real cause instead of
-  // just "process exited with code 1". Only the tail is kept to bound memory.
-  let stderrTail = "";
-  sdkOptions.stderr = (data: string) => {
-    stderrTail = (stderrTail + data).slice(-STDERR_TAIL_CHARS);
   };
   if (params.includePartialMessages) sdkOptions.includePartialMessages = true;
   if (params.mcpServers) sdkOptions.mcpServers = params.mcpServers;
@@ -124,11 +122,48 @@ export function trackedQuery(params: TrackedQueryParams): TrackedQueryResult {
   }
 
   if (params.extraOptions) Object.assign(sdkOptions, params.extraOptions);
+  return sdkOptions;
+}
 
-  const sdkQuery = query({
-    prompt: params.prompt,
-    options: sdkOptions,
+export function trackedQuery(params: TrackedQueryParams): TrackedQueryResult {
+  const startTime = Date.now();
+
+  const promptStr = params.promptPreview ?? (typeof params.prompt === "string" ? params.prompt : "(multi-modal input)");
+
+  // Insert pending request log (with full prompt for detail view)
+  const logId = insertPendingRequest({
+    apiKeyId: params.apiKeyId,
+    completionId: params.completionId,
+    requestedModel: params.requestedModel,
+    resolvedModel: params.resolvedModel,
+    isStream: params.isStreaming,
+    promptPreview: promptStr.slice(0, 200),
+    fullPrompt: promptStr,
   });
+
+  // Capture the CLI's stderr so failures are logged with the real cause instead of
+  // just "process exited with code 1". Only the tail is kept to bound memory.
+  let stderrTail = "";
+  const onStderr = (data: string) => {
+    stderrTail = (stderrTail + data).slice(-STDERR_TAIL_CHARS);
+  };
+
+  // Local patch: a prewarmed CLI (see sparePool) was started with these same options
+  // minus cwd/model; claiming it skips process start-up. A refused claim surfaces as an
+  // error result before any output, and the caller retries cold.
+  let sdkQuery: Query;
+  if (params.spare) {
+    params.spare.stderrSink.fn = onStderr;
+    sdkQuery = params.spare.process.claim({
+      prompt: params.prompt,
+      options: { cwd: params.cwd ?? process.cwd(), model: params.resolvedModel },
+    });
+    params.spare.process.claimed.catch((e: Error) => console.warn("[prewarm] claim refused:", e.message));
+  } else {
+    const sdkOptions = buildSdkOptions(params);
+    sdkOptions.stderr = onStderr;
+    sdkQuery = query({ prompt: params.prompt, options: sdkOptions });
+  }
 
   // Register active task
   registerTask(
@@ -150,10 +185,44 @@ export function trackedQuery(params: TrackedQueryParams): TrackedQueryResult {
     let inputTokens = 0;
     let outputTokens = 0;
     let totalCostUsd = 0;
+    // Local patch: upstream usage straight from the relayed stream (main thread only);
+    // the result message may be missing or lack cache fields when the run is cut short.
+    let cacheRead = 0;
+    let cacheWrite = 0;
+    let streamInput = 0;
+    let streamOutput = 0;
+    let sawMessageStop = false;
     const responseChunks: string[] = [];
+    const usage = () => ({
+      inputTokens: inputTokens || streamInput,
+      outputTokens: outputTokens || streamOutput,
+      cacheReadTokens: cacheRead,
+      cacheWriteTokens: cacheWrite,
+      totalCostUsd,
+      durationMs: Date.now() - startTime,
+    });
+    const recordForKey = () => {
+      if (params.apiKeyId) {
+        recordTokensForRateLimit(params.apiKeyId, (inputTokens || streamInput) + (outputTokens || streamOutput));
+        invalidateBudgetCache(params.apiKeyId);
+      }
+    };
 
     try {
       for await (const message of sdkQuery) {
+        if (message.type === "stream_event" && !message.parent_tool_use_id) {
+          const ev = message.event as { type: string; message?: { usage?: Record<string, number> }; usage?: Record<string, number> };
+          if (ev.type === "message_start" && ev.message?.usage) {
+            const u = ev.message.usage;
+            streamInput += u.input_tokens ?? 0;
+            cacheRead += u.cache_read_input_tokens ?? 0;
+            cacheWrite += u.cache_creation_input_tokens ?? 0;
+          } else if (ev.type === "message_delta" && ev.usage) {
+            streamOutput += ev.usage.output_tokens ?? 0;
+          } else if (ev.type === "message_stop") {
+            sawMessageStop = true;
+          }
+        }
         // Capture text from assistant messages for full_response logging
         if (message.type === "assistant") {
           const content = message.message?.content;
@@ -173,6 +242,10 @@ export function trackedQuery(params: TrackedQueryParams): TrackedQueryResult {
           inputTokens = message.usage?.input_tokens ?? 0;
           outputTokens = message.usage?.output_tokens ?? 0;
           totalCostUsd = message.total_cost_usd ?? 0;
+          if (!cacheRead && !cacheWrite) {
+            cacheRead = message.usage?.cache_read_input_tokens ?? 0;
+            cacheWrite = message.usage?.cache_creation_input_tokens ?? 0;
+          }
           // Also capture result text if available
           if (message.subtype === "success" && message.result && responseChunks.length === 0) {
             responseChunks.push(message.result as string);
@@ -181,27 +254,20 @@ export function trackedQuery(params: TrackedQueryParams): TrackedQueryResult {
         yield message;
       }
 
-      completeRequest(logId, "success", {
-        inputTokens,
-        outputTokens,
-        totalCostUsd,
-        durationMs: Date.now() - startTime,
-        fullResponse: responseChunks.join("\n"),
-      });
-
-      // Record token usage for rate limiting and invalidate budget cache
-      if (params.apiKeyId) {
-        recordTokensForRateLimit(params.apiKeyId, inputTokens + outputTokens);
-        invalidateBudgetCache(params.apiKeyId);
-      }
+      completeRequest(logId, "success", { ...usage(), fullResponse: responseChunks.join("\n") });
+      recordForKey();
     } catch (err: any) {
       // Hand the CLI's own words to the route layer so it can pick a status code.
       attachUpstreamText(err, [responseChunks.join("\n"), stderrTail].join("\n"));
+      // A complete upstream message followed by "max turns" is the normal end of an
+      // intercepted tool call (maxTurns: 1), not a failure.
+      if (sawMessageStop && /maximum number of turns|max_turns/i.test(String(err?.message ?? ""))) {
+        completeRequest(logId, "success", { ...usage(), fullResponse: responseChunks.join("\n") });
+        recordForKey();
+        throw err;
+      }
       completeRequest(logId, "error", {
-        inputTokens,
-        outputTokens,
-        totalCostUsd,
-        durationMs: Date.now() - startTime,
+        ...usage(),
         // The CLI reports API failures (404 model, usage limits) as assistant text
         // before exiting 1, so include that text and stderr alongside the exit error.
         errorMessage: [

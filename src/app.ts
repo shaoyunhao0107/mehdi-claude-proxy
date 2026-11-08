@@ -8,6 +8,7 @@ import { apiKeyAuth } from "./middleware/apiKeyAuth.js";
 import { rateLimitMiddleware } from "./middleware/rateLimiter.js";
 import { budgetCheckMiddleware } from "./middleware/budgetCheck.js";
 import { errorHandler } from "./middleware/errorHandler.js";
+import { concurrencyLimit } from "./middleware/concurrency.js";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -19,6 +20,8 @@ app.use(healthRoutes);
 app.use("/api/admin", adminApiRoutes);
 
 // /v1/* routes — protected by API key auth + budget check + rate limiting
+// Local patch: then a cap on concurrently running model requests (one CLI process each).
+app.use("/v1", apiKeyAuth, concurrencyLimit);
 // OpenAI-compatible: GET /v1/models, POST /v1/chat/completions
 app.use("/v1", apiKeyAuth, budgetCheckMiddleware, rateLimitMiddleware, proxyRoutes);
 // Native Anthropic Messages: POST /v1/messages

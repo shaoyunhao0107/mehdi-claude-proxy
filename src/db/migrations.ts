@@ -57,6 +57,13 @@ export function runMigrations(db: Database.Database): void {
   if (!logCols.some((c) => c.name === "full_response")) {
     db.exec("ALTER TABLE request_log ADD COLUMN full_response TEXT");
   }
+  // Local patch: prompt-cache usage per request (reads are cheap, writes are what costs quota).
+  if (!logCols.some((c) => c.name === "cache_read_tokens")) {
+    db.exec("ALTER TABLE request_log ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!logCols.some((c) => c.name === "cache_write_tokens")) {
+    db.exec("ALTER TABLE request_log ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0");
+  }
 
   // Migration: per-key rate limits, budget, model restrictions, system prompt, cache TTL
   // Re-read keyCols in case it was already read above (allow_builtin_tools migration)

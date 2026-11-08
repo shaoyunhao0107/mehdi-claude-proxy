@@ -95,6 +95,8 @@ export interface HistoryStats {
   total_cost_usd: number;
   total_input_tokens: number;
   total_output_tokens: number;
+  total_cache_read_tokens?: number;
+  total_cache_write_tokens?: number;
   by_model: Array<{
     model: string;
     count: number;

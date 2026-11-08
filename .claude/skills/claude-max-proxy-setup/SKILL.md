@@ -43,7 +43,7 @@ description: 在一台已登录 Claude Max 的机器上安装、配置、验证�
 | 工作目录 | CLI 每个请求**一定会**在最后附带它自己的 `# Environment`（工作目录、系统），没有开关能关掉，模型会以它为准。所以 `MIRROR_CLIENT_CWD`（默认开）会从客户端的环境信息里取出 "Primary working directory"，路径格式和服务器系统一致时（Windows 客户端对 Windows 服务器），就用这个路径作为 SDK 的 cwd，服务器上没有就建一个空目录，两边说法就一致了。格式对不上时（比如 Mac 客户端），退回到在最后一条消息末尾加一段官方格式的 `# Environment update`，写上客户端的环境，效果不如前者稳 |
 | 工具定义 | 和 CLI 内置工具同名的（Bash/Read/Edit/Write/Glob/Grep/WebFetch…）启用 CLI **自己的官方定义**；CLI 在这种模式下加载不了的（如 Agent、PowerShell）直接不带，不改名转发。客户端自己的 MCP 工具保持原名 `mcp__<server>__<tool>`；其他名字的工具放在 `mcp__local__`（`BRIDGE_MCP_SERVER` 可改）下面 |
 | 工具执行 | PreToolUse 钩子一律拒绝，**任何工具都不在服务器上执行**。工具调用从事件流里截下来交给客户端 |
-| 消息格式 | 最后一条是普通用户消息时（每轮聊天、Claude Code 每次新提问），走"原生模式"：用 `sessionStore` + `resume` 把历史交给 CLI，上游看到的是真正的多轮 user/assistant/tool_use/tool_result 消息。最后一条带 tool_result 时（Claude Code 的工具循环），CLI 没法从半路接着跑（恢复时会插入"中断"或 "No response requested." 标记），这时退回"转录模式"：历史拼成按消息分块的文本，说明文字放在 reminder 里，不放在系统提示里。原生模式出错时也自动退回转录模式 |
+| 消息格式 | 对话里还没有工具调用时（普通聊天、Claude Code 会话的第一个提问），走"原生模式"：用 `sessionStore` + `resume` 把历史交给 CLI，上游看到的是真正的多轮 user/assistant 消息。最后一条带 tool_result 时（Claude Code 的工具循环），CLI 没法从半路接着跑（恢复时会插入"中断"或 "No response requested." 标记），这时走"转录模式"：历史拼成按消息分块的文本，说明文字放在 reminder 里，不放在系统提示里。**对话一旦有过工具调用，之后的新提问也留在转录模式**：每次新提问都切回原生格式的话，整个历史前缀会变，缓存要整段重写（实测第二个提问约贵 5 倍）。`NATIVE_AFTER_TOOLS=true` 可恢复旧行为。原生模式出错时也自动退回转录模式 |
 | 服务器自己的东西 | 自动记忆和组织记忆关闭（`CLAUDE_CODE_DISABLE_AUTO_MEMORY` / `CLAUDE_CODE_DISABLE_ORG_MEMORY`），不加载本机配置和 skill |
 
 剩下没法去掉的：对话内容本身，包括用户写的设定和客户端自定义工具的名字、描述，这些是功能需要的。CLI 自己附加的日期、模型名、账号邮箱提醒也会带上，这些是官方行为。
@@ -171,7 +171,9 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
 ```
 
 分别用默认模型和 `ANTHROPIC_MODEL=claude-sonnet-4-6` 各跑一次。正常是 30–45 秒左右。
-加上 `--output-format json` 可以看 `usage`：多轮任务里 `cache_read_input_tokens` 应该明显大于 `cache_creation_input_tokens`。如果 cache_read 接近 0，说明历史拆块或系统提示不稳定，提示缓存失效了。
+加上 `--output-format json` 可以看 `usage`：多轮任务里 `cache_read_input_tokens` 应该明显大于 `cache_creation_input_tokens`。如果 cache_read 接近 0，说明历史拆块或系统提示不稳定，提示缓存失效了。注意 `total_cost_usd` 在同一会话里是累计值，比较单个提问要看 token 数。
+
+额度参考（2026-11-08 实测，Sonnet 5.5，同一会话两个提问，按 API 价折算）：第一个提问比本机直接用多约 15%；第二个提问约是直接用的 2 倍（改进前约 5 倍）。会话越长差距越明显，长任务之间多用 `/clear`。
 
 ## 本地补丁（相对上游，升级时要保留）
 
@@ -189,6 +191,10 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
 4. `src/middleware/adminAuth.ts`：管理接口只允许 127.0.0.1 / ::1 访问。
 5. 新增 `src/services/modelDiscovery.ts`，自动发现模型（见客户端配置一节）。`src/routes/proxy.ts` 的 `/v1/models` 改用它，同时带上 OpenAI 和 Anthropic 两种格式的字段。`src/server.ts` 启动时开始发现流程，`src/routes/adminApi.ts` 加了 `/models` 和 `/models/refresh` 两个接口。
 6. 新增 `scripts/install-windows.ps1`、`scripts/start-public.ps1` 和本 skill。
+7. 新增 `src/services/sparePool.ts`：用 SDK 官方的 `prewarm()` 提前起好 CLI 进程。工具循环里的每个请求，选项（系统提示、工具、思考、effort、max_tokens）都一样，所以每个请求之后按同样的选项预热一个备用进程，下一个请求 `claim()` 它，只设 cwd 和 model，省掉 1–2 秒启动。最多 `PREWARM_MAX_SPARES`（默认 2）个，闲置 `PREWARM_IDLE_MINUTES`（默认 10）分钟后关掉，每个约 250 MB；`PREWARM=false` 关闭。认领失败时自动冷启动重试。注意：预热进程会加载本机账号的 claude.ai 连接器（如 Claude Docs），所以 `QUIET_ENV` 里加了 `ENABLE_CLAUDEAI_MCP_SERVERS=false`，**不能去掉**。cwd 不能是 8.3 短路径（如 `ADMINI~1`），否则认领被拒（`unsafe_path`）。`sdkBridge.ts` 相应拆出了 `buildSdkOptions()`。
+8. 新增 `src/middleware/concurrency.ts`：同时运行的模型请求最多 `MAX_CONCURRENT_REQUESTS`（默认 4）个，多的排队；排队中客户端断开就出队。
+9. 用量记录：`request_log` 加了 `cache_read_tokens` / `cache_write_tokens` 两列（从转发的事件流里取）。工具调用被截下后 SDK 报的 "maximum number of turns" 记为 success，不再记成 error。`GET /api/admin/status` 返回服务器 CLI 版本、见过的客户端版本、并发和预热状态、当天用量。
+10. 版本检查：客户端 User-Agent 里的 Claude Code 版本和服务器 CLI 版本不同时，日志打一条 `[version]` 警告。Claude Code 客户端的系统提示是原样转发的，版本不一致时提示文字和上游的版本号对不上，两边要一起升级。
 
 ## 同步上游更新
 
@@ -219,6 +225,9 @@ npm install && npm run build                       # Windows 记得先重新放�
 | 抓客户端原始请求 | 在本机起一个转发代理，把请求体 dump 下来再转给 3457，用来对比 Claude Code 发了哪些新字段 |
 | 模型列表缺了某个模型 | 先看 `GET /api/admin/models` 里对应 ID 的 `status`，再 `POST /api/admin/models/refresh?full=1` 重新探测。`error` 状态是临时失败（限流、网络），下次刷新会自动重试 |
 | 模型探测报 "memory allocation failed" | 有探测在并行跑，内存不够。确认 `refreshModels` 是串行的；也可能是同时进来的请求太多 |
+| 日志里有 `[version] client Claude Code X differs` | 家里 Claude Code 和服务器 CLI 版本不同。把两边升到同一版本（服务器：`claude update` + `npm install @anthropic-ai/claude-agent-sdk@0.3.<N>`；客户端可以关自动更新固定版本） |
+| 日志里有 `[prewarm] claim refused` / `retrying cold` | 预热进程认领失败，已自动冷启动，不影响结果。频繁出现时看拒绝原因；可以 `PREWARM=false` 关掉 |
+| 想知道今天花了多少额度 | 本机 `curl -H "Authorization: Bearer <admin-secret>" http://127.0.0.1:3457/api/admin/status`，看 `today` 里的 cache_read / cache_write。缓存写入比读取贵得多 |
 | 看代理发给 Anthropic 的实际请求 | 另起一个测试实例，设 `ANTHROPIC_BASE_URL=http://127.0.0.1:<录制端口>`，录制程序记下请求（把 authorization 打码）后转发到 `api.anthropic.com` |
 
 日志在 `proxy.log`（Windows 上是 UTF-16 编码，用 `Get-Content` 看）。请求记录在 `data/proxy.db` 的 `request_log` 表。

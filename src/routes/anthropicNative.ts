@@ -8,11 +8,12 @@
 //    runs on this server - the tool_use is captured from the stream and returned.
 //  - "native" mode: the conversation so far is handed to the CLI as a real session
 //    (sessionStore + resume), so upstream sees genuine multi-turn messages with
-//    tool_use / tool_result / thinking blocks. Used whenever the last message is a
-//    user turn without tool_result (every chat turn, every new Claude Code prompt).
+//    tool_use / tool_result / thinking blocks. Used for user turns while the conversation
+//    has no tool calls yet (chat turns, the first prompt of a Claude Code session).
 //  - "transcript" mode: when the last message carries tool_result, the CLI cannot
 //    resume mid-turn (it inserts "interrupted"/"No response requested." markers), so
-//    history is sent as per-message text blocks instead. Also the fallback if native fails.
+//    history is sent as per-message text blocks instead. Once a conversation has tool
+//    calls it stays in this mode, so the cached prefix keeps growing. Also the fallback.
 //  - Images / PDFs pass as real blocks; the upstream event stream is relayed as-is;
 //    thinking / effort / max_tokens follow the client.
 import type { Request, Response } from "express";
@@ -27,7 +28,8 @@ import { randomUUID } from "crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { join } from "path";
-import { trackedQuery } from "../services/sdkBridge.js";
+import { trackedQuery, type ClaimableSpare, type SdkOptionParams } from "../services/sdkBridge.js";
+import { ensureSpare, prewarmEnabled, spareKey, takeSpare } from "../services/sparePool.js";
 import { cancelTask } from "../services/taskTracker.js";
 import { classifyUpstreamError } from "../services/errorClassifier.js";
 import { jsonSchemaToZodShape, sanitizeToolName } from "../services/toolBridge.js";
@@ -59,6 +61,9 @@ export interface NativeParams {
 }
 
 const NATIVE_HISTORY = process.env.NATIVE_HISTORY !== "false";
+// true = old behaviour: native mode for every new prompt, even after tool calls (costs a
+// full-history cache re-write per prompt).
+const NATIVE_AFTER_TOOLS = process.env.NATIVE_AFTER_TOOLS === "true";
 // "official" (default): upstream system prompt is the CLI's own Claude Code preset; the
 // client's system prompt is either dropped (if it is itself a Claude Code prompt) or moved
 // into a <system-reminder> in the first user message, the way Claude Code carries CLAUDE.md.
@@ -73,8 +78,34 @@ const BRIDGE_SERVER = sanitizeToolName(process.env.BRIDGE_MCP_SERVER || "local")
 const LABEL: Record<string, string> = { user: "User", assistant: "Assistant", system: "System" };
 // Keep only the most recent N images/documents from history (older ones become a placeholder).
 const MAX_MEDIA = parseInt(process.env.MAX_HISTORY_IMAGES || "8", 10);
-// CLI version that matches the bundled SDK (SDK 0.3.N ships CLI 2.1.N); stamped on transcript entries.
-const CLI_VERSION = (process.env.CLAUDE_AGENT_SDK_VERSION || "0.3.319").replace(/^0\.3\./, "2.1.");
+// CLI version stamped on transcript entries: the bundled SDK's (SDK 0.3.N ships CLI 2.1.N)
+// until the CLI's own init message reports the real one.
+function bundledSdkVersion(): string {
+  try {
+    const p = join(process.cwd(), "node_modules", "@anthropic-ai", "claude-agent-sdk", "package.json");
+    return (JSON.parse(readFileSync(p, "utf8")) as { version: string }).version;
+  } catch {
+    return process.env.CLAUDE_AGENT_SDK_VERSION || "0.3.319";
+  }
+}
+let CLI_VERSION = bundledSdkVersion().replace(/^0\.3\./, "2.1.");
+
+// A Claude Code client's system prompt is forwarded as is, while upstream sees this
+// server's CLI version: different versions mean prompt text and version header disagree.
+const warnedClientVersions = new Set<string>();
+export const versionInfo = { serverCli: () => CLI_VERSION, clients: new Map<string, string>() };
+function checkClientVersion(req: Request): void {
+  const m = /^claude-cli\/(\d+\.\d+\.\d+)/.exec(String(req.headers["user-agent"] ?? ""));
+  if (!m) return;
+  versionInfo.clients.set(m[1], new Date().toISOString());
+  if (m[1] !== CLI_VERSION && !warnedClientVersions.has(m[1])) {
+    warnedClientVersions.add(m[1]);
+    console.warn(
+      `[version] client Claude Code ${m[1]} differs from this server's CLI ${CLI_VERSION}. ` +
+        `Its system prompt is forwarded as is, so keep both on the same version.`,
+    );
+  }
+}
 
 // Transcript mode only. Stable across requests so it stays inside the cached prefix.
 const TRANSCRIPT_NOTE =
@@ -560,6 +591,7 @@ function errorPayload(err: unknown): Block {
 
 export async function handleNative(req: Request, res: Response, p: NativeParams): Promise<void> {
   const { body } = p;
+  checkClientVersion(req);
   const clientTools = body.tool_choice?.type === "none" ? [] : p.clientTools;
 
   let plan: ToolPlan;
@@ -585,7 +617,14 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   const last = nonSystem[nonSystem.length - 1];
   const lastHasToolResult = Array.isArray(last?.content) && last.content.some((b) => b.type === "tool_result");
   let native: NMsg[] | null = null;
-  if (NATIVE_HISTORY && last?.role === "user" && !lastHasToolResult) native = normalize(body.messages, plan.toUpstream);
+  // Once tools were used, stay in transcript mode: rebuilding the history in native form for
+  // each new prompt changes the whole message prefix and re-writes it to the prompt cache.
+  const hasToolHistory = body.messages.some(
+    (m) => Array.isArray(m.content) && m.content.some((b) => b.type === "tool_use" || b.type === "tool_result"),
+  );
+  if (NATIVE_HISTORY && last?.role === "user" && !lastHasToolResult && (!hasToolHistory || NATIVE_AFTER_TOOLS)) {
+    native = normalize(body.messages, plan.toUpstream);
+  }
 
   const acc: Acc = { blocks: [], partialJson: {}, stopReason: null, stopSequence: null, usage: {} };
   let started = false; // stream: message_start relayed
@@ -608,7 +647,11 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
     });
   };
 
-  async function run(mode: "native" | "transcript"): Promise<void> {
+  // Client MCP tool definitions, part of what a prewarmed spare must match.
+  const toolsSig = JSON.stringify(clientTools.map((t) => [t.name, t.description ?? "", t.input_schema ?? null]));
+  let usedSpare = false;
+
+  async function run(mode: "native" | "transcript", allowSpare = true): Promise<void> {
     let content: Block[];
     let systemPrompt: string | undefined;
     const extraOptions: Record<string, unknown> = { hooks: DENY_ALL_TOOLS };
@@ -674,15 +717,8 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
       yield { type: "user", message: { role: "user", content }, parent_tool_use_id: null, session_id: "" } as unknown as SDKUserMessage;
     }
 
-    const { generator } = trackedQuery({
-      completionId: p.messageId,
-      prompt: input(),
-      promptPreview: `[${mode}] ${previewOf(body.messages)}`,
-      requestedModel: p.requestedModel,
+    const optionParams: SdkOptionParams = {
       resolvedModel: p.resolvedModel,
-      isStreaming: p.stream,
-      apiKeyId: req.apiKeyId ?? null,
-      apiKeyName: req.apiKeyName ?? null,
       includePartialMessages: true,
       mcpServers: plan.mcpServers,
       builtInTools: plan.builtins,
@@ -693,12 +729,40 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
       effort: mapEffort(body.output_config),
       extraEnv,
       extraOptions,
+    };
+
+    // Prewarmed CLI (see sparePool): transcript-mode requests of a tool-using client share
+    // all start-up options, so the next one can claim a process started in advance.
+    // Native mode resumes a session, which a spare cannot take, but it refills the pool.
+    let spare: ClaimableSpare | null = null;
+    if (prewarmEnabled() && clientTools.length > 0) {
+      const transcriptExtra: Record<string, unknown> = { hooks: DENY_ALL_TOOLS };
+      if (extraOptions.systemPrompt) transcriptExtra.systemPrompt = extraOptions.systemPrompt;
+      const spareParams: SdkOptionParams = { ...optionParams, extraOptions: transcriptExtra };
+      const key = spareKey(spareParams, toolsSig);
+      if (mode === "transcript" && allowSpare) spare = await takeSpare(key);
+      ensureSpare(key, () => ({ ...spareParams, mcpServers: planTools(clientTools).mcpServers }));
+    }
+    usedSpare = spare !== null;
+
+    const { generator } = trackedQuery({
+      ...optionParams,
+      completionId: p.messageId,
+      prompt: input(),
+      promptPreview: `[${mode}${spare ? ", warm" : ""}] ${previewOf(body.messages)}`,
+      requestedModel: p.requestedModel,
+      isStreaming: p.stream,
+      apiKeyId: req.apiKeyId ?? null,
+      apiKeyName: req.apiKeyName ?? null,
+      spare: spare ?? undefined,
     });
 
     for await (const m of generator) {
       if (clientGone) break;
       if (finished) continue; // drain the rest so the request log completes
       if (m.type === "system" && (m as { subtype?: string }).subtype === "init") {
+        const v = (m as { claude_code_version?: string }).claude_code_version;
+        if (v && v !== CLI_VERSION) CLI_VERSION = v;
         const loaded = new Set((m as { tools?: string[] }).tools ?? []);
         for (const b of plan.builtins) {
           if (!loaded.has(b) && !notBuiltin.has(b)) {
@@ -766,10 +830,12 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
     // intercepted tool call). That is the normal path, not a failure.
     if (!finished) {
       const nothingSent = !started && acc.blocks.length === 0;
-      if (firstMode === "native" && nothingSent && !clientGone) {
-        console.warn("[native] native mode failed before any output, retrying in transcript mode:", (err as Error)?.message);
+      if ((firstMode === "native" || usedSpare) && nothingSent && !clientGone) {
+        // Native mode failed, or a prewarmed spare refused the claim: retry cold in
+        // transcript mode (same request, nothing has reached the client yet).
+        console.warn(`[native] ${usedSpare ? "prewarmed spare" : "native mode"} failed before any output, retrying cold in transcript mode:`, (err as Error)?.message);
         try {
-          await run("transcript");
+          await run("transcript", false);
         } catch (err2) {
           if (!finished) fail(err2);
         }

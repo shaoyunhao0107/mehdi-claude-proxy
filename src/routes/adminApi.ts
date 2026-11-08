@@ -5,6 +5,9 @@ import { queryHistory, getStats, getRequestDetail } from "../services/historySer
 import { getTokenStatus, setSetting, deleteSetting } from "../services/settingsService.js";
 import { adminAuth } from "../middleware/adminAuth.js";
 import { getDiscoveryStatus, refreshModels } from "../services/modelDiscovery.js";
+import { versionInfo } from "./anthropicNative.js";
+import { concurrencyStatus } from "../middleware/concurrency.js";
+import { spareStatus } from "../services/sparePool.js";
 
 const router = Router();
 
@@ -20,6 +23,18 @@ router.get("/models", (_req, res) => {
 router.post("/models/refresh", async (req, res) => {
   await refreshModels(req.query.full === "1" || req.query.full === "true");
   res.json(getDiscoveryStatus());
+});
+
+// GET /api/admin/status - versions, concurrency queue, today's usage incl. prompt cache (local patch).
+router.get("/status", (_req, res) => {
+  const today = new Date().toISOString().slice(0, 10);
+  res.json({
+    serverCliVersion: versionInfo.serverCli(),
+    clientVersionsSeen: Object.fromEntries(versionInfo.clients),
+    concurrency: concurrencyStatus(),
+    prewarm: spareStatus(),
+    today: getStats(`${today} 00:00:00`),
+  });
 });
 
 // --- API Keys ---
