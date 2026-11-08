@@ -6,6 +6,7 @@ import { classifyUpstreamError } from "../services/errorClassifier.js";
 import { trackedQuery } from "../services/sdkBridge.js";
 import { cancelTask } from "../services/taskTracker.js";
 import { resolveModel } from "../models.js";
+import { handleNative, type NativeBody } from "./anthropicNative.js";
 import { resolve as resolvePath } from "path";
 const SDK_CWD = resolvePath(process.env.SDK_CWD || "./data/sdk-cwd");
 mkdirSync(SDK_CWD, { recursive: true });
@@ -323,10 +324,7 @@ function validateRequest(body: AnthropicRequest): ValidationError | null {
     ];
   }
 
-  // Local patch: Claude Code always sends `thinking`; ignore it instead of rejecting.
-  if (body.thinking !== undefined) {
-    delete (body as { thinking?: unknown }).thinking;
-  }
+  // Local patch: `thinking` is accepted (Claude Code always sends it); the native handler maps it.
 
   // Validate system (only text blocks allowed)
   if (body.system !== undefined && typeof body.system !== "string") {
@@ -437,52 +435,35 @@ router.post("/messages", async (req: Request, res: Response) => {
       return;
     }
 
-    if (needsToolPath(body)) {
-      // Validate tools (if present). Tool path requires either tools OR history
-      // containing tool_use/tool_result blocks.
-      let clientTools: ClientTool[] = [];
-      if (body.tools !== undefined) {
-        const toolsResult = validateToolsArray(body.tools);
-        if (!Array.isArray(toolsResult) || typeof toolsResult[0] === "number") {
-          // It's a ValidationError tuple
-          const ve = toolsResult as ValidationError;
-          anthropicError(res, ve[0], ve[1], ve[2]);
-          return;
-        }
-        clientTools = toolsResult as ClientTool[];
+    // Local patch: everything except server-tool requests goes through the native handler
+    // (anthropicNative.ts): block-split history (prompt cache), images, thinking, real streaming.
+    let clientTools: ClientTool[] = [];
+    if (body.tools !== undefined) {
+      const toolsResult = validateToolsArray(body.tools);
+      if (!Array.isArray(toolsResult) || typeof toolsResult[0] === "number") {
+        const ve = toolsResult as ValidationError;
+        anthropicError(res, ve[0], ve[1], ve[2]);
+        return;
       }
-      // If the path is triggered only by history blocks (no tools in request),
-      // that's a follow-up where tools should be re-sent. Allow it (the prior
-      // tool_use/tool_result pairs are encoded into the prompt as text context).
-      // NOTE: this is more permissive than the Anthropic API, but avoids rejecting
-      // valid multi-turn flows where the client drops tools from the request.
+      clientTools = toolsResult as ClientTool[];
+    }
 
-      await handleWithTools(req, res, {
-        messageId,
-        requestedModel,
-        resolvedModel,
-        stream,
-        body,
-        clientTools,
-      });
+    if (clientTools.some((t) => isServerTool(t as unknown as Record<string, unknown>))) {
+      // Anthropic server tools (web_search_2025xxxx, ...) are executed by the SDK on this
+      // server via Claude Code built-ins: keep the original multi-turn path for those.
+      await handleWithTools(req, res, { messageId, requestedModel, resolvedModel, stream, body, clientTools });
       return;
     }
 
-    // Plain-text path: no tools, no tool_use/tool_result history. Existing behavior.
-    const systemText = normalizeSystem(body.system);
-    const prompt = buildPromptFromHistory(body.messages);
-    const systemParts: string[] = [];
-    if (req.keySystemPrompt) systemParts.push(req.keySystemPrompt);
-    if (systemText) systemParts.push(systemText);
-    const fullPrompt = systemParts.length > 0
-      ? `[System instruction]: ${systemParts.join("\n\n")}\n\n${prompt}`
-      : prompt;
-
-    if (stream) {
-      await handleStreamingPlain(req, res, messageId, requestedModel, resolvedModel, fullPrompt);
-    } else {
-      await handleNonStreamingPlain(req, res, messageId, requestedModel, resolvedModel, fullPrompt);
-    }
+    await handleNative(req, res, {
+      messageId,
+      requestedModel,
+      resolvedModel,
+      stream,
+      body: body as unknown as NativeBody,
+      clientTools,
+      sdkCwd: SDK_CWD,
+    });
   } catch (error: unknown) {
     console.error("Error in /v1/messages:", error);
     if (!res.headersSent) anthropicUpstreamError(res, error);

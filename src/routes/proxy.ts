@@ -94,12 +94,20 @@ function buildPromptFromTranslated(
 router.get("/models", (_req, res) => {
   res.json({
     object: "list",
+    // Local patch: fields for both OpenAI (object/owned_by/created) and Anthropic
+    // (type/display_name/created_at) model-list clients.
     data: AVAILABLE_MODELS.map((m) => ({
       id: m.id,
       object: "model",
+      type: "model",
+      display_name: m.name,
       created: Math.floor(Date.now() / 1000),
+      created_at: new Date().toISOString(),
       owned_by: "anthropic",
     })),
+    has_more: false,
+    first_id: AVAILABLE_MODELS[0]?.id ?? null,
+    last_id: AVAILABLE_MODELS[AVAILABLE_MODELS.length - 1]?.id ?? null,
   });
 });
 

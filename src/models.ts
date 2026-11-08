@@ -18,17 +18,16 @@ export const MODEL_MAP: Record<string, string> = {
   "nomic-embed-text": "nomic-embed-text",
 };
 
+// Local patch: only real Claude models available on a Max plan (verified 2026-11-07).
+// GPT / embedding aliases still resolve via MODEL_MAP but are not advertised.
+// claude-fable-5-1 is omitted: it needs separate usage credits, not plan quota.
 export const AVAILABLE_MODELS = [
+  { id: "claude-opus-5-5", name: "Claude Opus 5.5" },
+  { id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5" },
+  { id: "claude-haiku-5-5", name: "Claude Haiku 5.5" },
   { id: "claude-opus-4-6", name: "Claude Opus 4.6" },
   { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
   { id: "claude-haiku-4-5", name: "Claude Haiku 4.5" },
-  { id: "gpt-4o", name: "GPT-4o (mapped to Claude Sonnet 4.6)" },
-  { id: "gpt-4", name: "GPT-4 (mapped to Claude Sonnet 4.6)" },
-  { id: "gpt-3.5-turbo", name: "GPT-3.5 Turbo (mapped to Claude Haiku 4.5)" },
-  { id: "nomic-embed-text", name: "Nomic Embed Text (local, via Ollama)" },
-  { id: "text-embedding-3-small", name: "text-embedding-3-small (mapped to nomic-embed-text)" },
-  { id: "text-embedding-3-large", name: "text-embedding-3-large (mapped to nomic-embed-text)" },
-  { id: "text-embedding-ada-002", name: "text-embedding-ada-002 (mapped to nomic-embed-text)" },
 ];
 
 export function resolveModel(requested: string): string {

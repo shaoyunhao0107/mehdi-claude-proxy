@@ -1,4 +1,4 @@
-import { query, type Query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { registerTask, unregisterTask } from "./taskTracker.js";
 import { insertPendingRequest, completeRequest } from "./historyService.js";
 import { recordTokensForRateLimit } from "../middleware/rateLimiter.js";
@@ -10,7 +10,9 @@ const STDERR_TAIL_CHARS = 4000;
 
 interface TrackedQueryParams {
   completionId: string;
-  prompt: string;
+  // A string, or an async iterable of SDKUserMessage (structured blocks / images).
+  prompt: string | AsyncIterable<SDKUserMessage>;
+  promptPreview?: string;
   requestedModel: string;
   resolvedModel: string;
   isStreaming: boolean;
@@ -26,7 +28,22 @@ interface TrackedQueryParams {
   maxTurns?: number;
   permissionMode?: string;
   cwd?: string;
+  // Local patch: native-path options.
+  thinking?:
+    | { type: "adaptive"; display?: "summarized" | "omitted" }
+    | { type: "enabled"; budgetTokens: number; display?: "summarized" | "omitted" }
+    | { type: "disabled" };
+  effort?: string;
+  extraEnv?: Record<string, string>;
 }
+
+// Local patch: env applied to every SDK subprocess. Skips the session-title call,
+// the /api/hello probe and telemetry, so a request costs exactly one API call.
+const QUIET_ENV: Record<string, string> = {
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+  DISABLE_TELEMETRY: "1",
+  DISABLE_ERROR_REPORTING: "1",
+};
 
 interface TrackedQueryResult {
   generator: AsyncGenerator<any, void>;
@@ -36,7 +53,7 @@ interface TrackedQueryResult {
 export function trackedQuery(params: TrackedQueryParams): TrackedQueryResult {
   const startTime = Date.now();
 
-  const promptStr = typeof params.prompt === "string" ? params.prompt : "(multi-modal input)";
+  const promptStr = params.promptPreview ?? (typeof params.prompt === "string" ? params.prompt : "(multi-modal input)");
 
   // Insert pending request log (with full prompt for detail view)
   const logId = insertPendingRequest({
@@ -56,6 +73,8 @@ export function trackedQuery(params: TrackedQueryParams): TrackedQueryResult {
     model: params.resolvedModel,
     maxTurns: params.maxTurns ?? 1,
     settingSources: [],
+    // Local patch: never write session transcripts for proxied requests.
+    persistSession: false,
   };
   // Capture the CLI's stderr so failures are logged with the real cause instead of
   // just "process exited with code 1". Only the tail is kept to bound memory.
@@ -69,7 +88,11 @@ export function trackedQuery(params: TrackedQueryParams): TrackedQueryResult {
   if (params.disallowedTools) sdkOptions.disallowedTools = params.disallowedTools;
   if (params.permissionMode) sdkOptions.permissionMode = params.permissionMode;
   if (params.cwd) sdkOptions.cwd = params.cwd;
-  if (params.builtInTools !== undefined) sdkOptions.tools = params.builtInTools;
+  // Local patch: default to NO built-in tools. The SDK default is the full Claude Code
+  // tool set (Bash/Write/...), which would run on this server and add ~17k tokens of context.
+  sdkOptions.tools = params.builtInTools ?? [];
+  if (params.thinking) sdkOptions.thinking = params.thinking;
+  if (params.effort) sdkOptions.effort = params.effort;
   if (params.systemPrompt !== undefined) sdkOptions.systemPrompt = params.systemPrompt;
 
   // Inject the OAuth token from database/env into the SDK subprocess environment.
@@ -89,7 +112,10 @@ export function trackedQuery(params: TrackedQueryParams): TrackedQueryResult {
     } else {
       env.ANTHROPIC_API_KEY = oauthToken;
     }
+    Object.assign(env, QUIET_ENV, params.extraEnv ?? {});
     sdkOptions.env = env;
+  } else {
+    sdkOptions.env = { ...process.env, ...QUIET_ENV, ...(params.extraEnv ?? {}) };
   }
 
   const sdkQuery = query({
