@@ -37,7 +37,10 @@ description: 在一台已登录 Claude Max 的机器上安装、配置、验证�
 | 项目 | 做法 |
 |---|---|
 | 请求头、User-Agent、metadata | 一律不转发。上游的身份是官方 Agent SDK：`claude-cli/<ver> (external, sdk-cli, agent-sdk/<ver>)` |
-| 系统提示 | `SYSTEM_PROMPT_MODE=official`（默认）：使用 CLI 自带的 Claude Code 预设（`excludeDynamicSections`）。客户端的系统提示如果本身就是 Claude Code 官方提示，直接丢掉；如果是第三方的（比如 Cherry 的助手设定），放进第一条用户消息里的 `<system-reminder>`，和官方带 CLAUDE.md 的方式一样。设 `CLIENT_SYSTEM=drop` 则第三方系统提示完全不带 |
+| 系统提示 | `SYSTEM_PROMPT_MODE=official`（默认）：使用 CLI 自带的 Claude Code 预设（`excludeDynamicSections`）。分两种情况：
+- 客户端是 Claude Code，系统提示本身就是官方的：**原样使用**，因为里面有客户端的环境信息。之前试过换成服务器的预设，模型会跑去服务器路径找文件，一个任务兜了 67 轮。
+- 第三方客户端（比如 Cherry 的助手设定）：上游换成官方预设，第三方的系统提示放进第一条用户消息的 `<system-reminder>`，和官方带 CLAUDE.md 的方式一样。设 `CLIENT_SYSTEM=drop` 则完全不带 |
+| 工作目录 | CLI 每个请求**一定会**在最后附带它自己的 `# Environment`（工作目录、系统），没有开关能关掉，模型会以它为准。所以 `MIRROR_CLIENT_CWD`（默认开）会从客户端的环境信息里取出 "Primary working directory"，路径格式和服务器系统一致时（Windows 客户端对 Windows 服务器），就用这个路径作为 SDK 的 cwd，服务器上没有就建一个空目录，两边说法就一致了。格式对不上时（比如 Mac 客户端），退回到在最后一条消息末尾加一段官方格式的 `# Environment update`，写上客户端的环境，效果不如前者稳 |
 | 工具定义 | 和 CLI 内置工具同名的（Bash/Read/Edit/Write/Glob/Grep/WebFetch…）启用 CLI **自己的官方定义**；CLI 在这种模式下加载不了的（如 Agent、PowerShell）直接不带，不改名转发。客户端自己的 MCP 工具保持原名 `mcp__<server>__<tool>`；其他名字的工具放在 `mcp__local__`（`BRIDGE_MCP_SERVER` 可改）下面 |
 | 工具执行 | PreToolUse 钩子一律拒绝，**任何工具都不在服务器上执行**。工具调用从事件流里截下来交给客户端 |
 | 消息格式 | 最后一条是普通用户消息时（每轮聊天、Claude Code 每次新提问），走"原生模式"：用 `sessionStore` + `resume` 把历史交给 CLI，上游看到的是真正的多轮 user/assistant/tool_use/tool_result 消息。最后一条带 tool_result 时（Claude Code 的工具循环），CLI 没法从半路接着跑（恢复时会插入"中断"或 "No response requested." 标记），这时退回"转录模式"：历史拼成按消息分块的文本，说明文字放在 reminder 里，不放在系统提示里。原生模式出错时也自动退回转录模式 |
@@ -210,6 +213,7 @@ npm install && npm run build                       # Windows 记得先重新放�
 | 管理接口 404 | 不是从本机访问的，这是设计如此 |
 | 启动后 `better-sqlite3` 报错 | 本地模块没编译：先 `npm install-scripts approve better-sqlite3`，再 `npm rebuild better-sqlite3` |
 | 本机能通、外网不通 | 云安全组 / NAT 没放行端口。注意本机有代理 TUN（如 198.18.x）时，查到的"公网 IP"可能是代理的出口 IP |
+| Claude Code 任务轮数暴增，模型说"工作目录不一致"、往服务器路径写文件 | 客户端工作目录没对上：检查 `MIRROR_CLIENT_CWD` 有没有被关掉、客户端的系统提示有没有被替换掉（必须原样使用），以及客户端路径格式和服务器是否一致 |
 | 一句"你好"就花上万 tokens，或者模型提到服务器上的文件、工具 | 补丁 2 的 `tools: []` 默认值丢了 |
 | 客户端开了思考却看不到思考内容 | 补丁 3：`thinking` 在校验阶段被删了，或者没映射成 `adaptive` + `display: summarized`（CLI 会忽略固定预算） |
 | 抓客户端原始请求 | 在本机起一个转发代理，把请求体 dump 下来再转给 3457，用来对比 Claude Code 发了哪些新字段 |

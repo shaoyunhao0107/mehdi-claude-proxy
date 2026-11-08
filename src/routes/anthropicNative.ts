@@ -24,7 +24,7 @@ import {
   type HookEvent,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
-import { existsSync, readFileSync, readdirSync, rmSync, statSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { join } from "path";
 import { trackedQuery } from "../services/sdkBridge.js";
@@ -205,6 +205,27 @@ function clientEnvironment(messages: Msg[], clientSystem?: string): string | nul
     if (sec) return sec;
   }
   return null;
+}
+
+/**
+ * Run the CLI in the CLIENT's working directory when that path is usable on this OS, so
+ * the environment the CLI always attaches (last in the request) names the same directory
+ * the client works in. The directory is created empty if missing; no tool ever runs here.
+ */
+const MIRROR_CLIENT_CWD = process.env.MIRROR_CLIENT_CWD !== "false";
+function mirroredCwd(env: string | null): string | null {
+  if (!MIRROR_CLIENT_CWD || !env) return null;
+  const m = /Primary working directory:\s*(.+)/.exec(env);
+  const dir = m?.[1].trim();
+  if (!dir) return null;
+  const usable = process.platform === "win32" ? /^[A-Za-z]:[\\/]/.test(dir) : dir.startsWith("/");
+  if (!usable || dir.includes("\0")) return null;
+  try {
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  } catch {
+    return null;
+  }
 }
 
 function previewOf(messages: Msg[]): string {
@@ -550,6 +571,9 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   }
 
   const clientSystem = systemText(body.system);
+  const clientEnv = clientSystem && LOOKS_OFFICIAL.test(clientSystem.slice(0, 400))
+    ? clientEnvironment(body.messages, clientSystem) : null;
+  const runCwd = mirroredCwd(clientEnv) ?? p.sdkCwd;
   const extraEnv: Record<string, string> = {};
   if (typeof body.max_tokens === "number" && body.max_tokens > 0) {
     extraEnv.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(body.max_tokens);
@@ -616,7 +640,7 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
       if (history.length > 0) {
         await ensureFreshToken(p.sdkCwd);
         const sessionId = randomUUID();
-        const entries = buildEntries(history, sessionId, p.sdkCwd, p.resolvedModel);
+        const entries = buildEntries(history, sessionId, runCwd, p.resolvedModel);
         extraOptions.resume = sessionId;
         extraOptions.persistSession = true; // required by sessionStore; writes go to the SDK's temp resume dir
         extraOptions.sessionStore = {
@@ -632,10 +656,10 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
       systemPrompt = (single ? sysParts : [TRANSCRIPT_NOTE, ...sysParts]).join("\n\n") || undefined;
       if (SYSTEM_PROMPT_MODE === "official") content = [...reminderBlocks(single ? [] : [TRANSCRIPT_NOTE]), ...content];
     }
-    // Claude Code clients: restate the client's environment last (see clientEnvironment).
-    if (clientIsOfficial) {
-      const env = clientEnvironment(body.messages, clientSystem);
-      if (env) content = [...content, { type: "text", text: `<system-reminder>\n# Environment update\n${env}\n</system-reminder>` }];
+    // Claude Code client whose cwd could not be mirrored (e.g. a Mac client on this Windows
+    // server): restate the client's environment last instead (see clientEnvironment).
+    if (clientIsOfficial && clientEnv && runCwd === p.sdkCwd) {
+      content = [...content, { type: "text", text: `<system-reminder>\n# Environment update\n${clientEnv}\n</system-reminder>` }];
     }
     if (SYSTEM_PROMPT_MODE === "official") {
       if (clientIsOfficial) {
@@ -664,7 +688,7 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
       builtInTools: plan.builtins,
       systemPrompt,
       maxTurns: 1,
-      cwd: p.sdkCwd,
+      cwd: runCwd,
       thinking: mapThinking(body.thinking, p.resolvedModel, body.max_tokens),
       effort: mapEffort(body.output_config),
       extraEnv,
