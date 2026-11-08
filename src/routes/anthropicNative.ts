@@ -6,14 +6,18 @@
 //    CLI's OWN official definitions; other client tools keep their own names
 //    (mcp__server__tool stays as is). A PreToolUse hook denies every call, so nothing
 //    runs on this server - the tool_use is captured from the stream and returned.
-//  - "native" mode: the conversation so far is handed to the CLI as a real session
-//    (sessionStore + resume), so upstream sees genuine multi-turn messages with
-//    tool_use / tool_result / thinking blocks. Used for user turns while the conversation
-//    has no tool calls yet (chat turns, the first prompt of a Claude Code session).
-//  - "transcript" mode: when the last message carries tool_result, the CLI cannot
-//    resume mid-turn (it inserts "interrupted"/"No response requested." markers), so
-//    history is sent as per-message text blocks instead. Once a conversation has tool
-//    calls it stays in this mode, so the cached prefix keeps growing. Also the fallback.
+//  - "session" mode (Claude Code clients, main loop): one real CLI session per client
+//    conversation (metadata.user_id session id), kept in conversationStore. Each request
+//    resumes it and sends only what is new; tool results resume at the tool-call entry
+//    with resumeSessionAt + forkSession, which drops the synthetic denial (mechanism from
+//    rynfar/meridian). Upstream sees exactly a direct CLI session's messages, and the
+//    prompt cache extends like one. History that does not extend the kept session
+//    (proxy restart, client rewind/compaction) is rebuilt once from the client's messages.
+//  - "native" mode (other clients): the conversation is handed to the CLI as a
+//    synthetic session (sessionStore + resume) for genuine multi-turn messages.
+//  - "transcript" mode: history as per-message text blocks. Only the fallback now
+//    (session/native failure, non-Claude-Code tool loops); resuming a synthetic history
+//    that ends in a tool_result makes the CLI insert "interrupted" markers.
 //  - Images / PDFs pass as real blocks; the upstream event stream is relayed as-is;
 //    thinking / effort / max_tokens follow the client.
 import type { Request, Response } from "express";
@@ -25,11 +29,15 @@ import {
   type HookEvent,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { join } from "path";
 import { trackedQuery, type ClaimableSpare, type SdkOptionParams } from "../services/sdkBridge.js";
 import { ensureSpare, prewarmEnabled, spareKey, takeSpare } from "../services/sparePool.js";
+import {
+  awaitTurn, beginTurn, CONTINUITY_ENABLED, conversationKey, dropTranscript, forget, getConversation, memorySessionStore,
+  messageHash, removeLocalTranscript, saveConversation, seedTranscript,
+} from "../services/conversationStore.js";
 import { cancelTask } from "../services/taskTracker.js";
 import { classifyUpstreamError } from "../services/errorClassifier.js";
 import { jsonSchemaToZodShape, sanitizeToolName } from "../services/toolBridge.js";
@@ -49,6 +57,7 @@ export interface NativeBody {
   thinking?: unknown;
   output_config?: unknown;
   tool_choice?: { type?: string };
+  metadata?: unknown;
 }
 export interface NativeParams {
   messageId: string;
@@ -126,7 +135,27 @@ const KNOWN_BUILTINS = new Set([
   "Monitor", "TaskStop", "TaskOutput", "ListAgents", "SendMessage", "ScheduleWakeup",
   "CronCreate", "CronDelete", "CronList", "ReportFindings", "PushNotification", "RemoteTrigger", "LSP",
 ]);
-const notBuiltin = new Set<string>();
+// Persisted across restarts: re-learning it costs the first conversation a cache miss
+// (the tool list, which leads the cached prefix, shrinks between its first two requests).
+const NOT_BUILTIN_PATH = join(process.cwd(), "data", "not-builtin.json");
+const notBuiltin = new Set<string>(loadNotBuiltin());
+function loadNotBuiltin(): string[] {
+  try {
+    const v = JSON.parse(readFileSync(NOT_BUILTIN_PATH, "utf8")) as { version?: string; tools?: string[] };
+    // Learned per CLI version: a newer CLI may load these tools.
+    return v.version === CLI_VERSION && Array.isArray(v.tools) ? v.tools : [];
+  } catch {
+    return [];
+  }
+}
+function saveNotBuiltin(): void {
+  try {
+    mkdirSync(join(process.cwd(), "data"), { recursive: true });
+    writeFileSync(NOT_BUILTIN_PATH, JSON.stringify({ version: CLI_VERSION, tools: [...notBuiltin] }));
+  } catch {
+    /* best effort */
+  }
+}
 
 const MCP_NAME_RE = /^mcp__([A-Za-z0-9_-]+?)__(.+)$/;
 
@@ -184,6 +213,33 @@ const DENY_ALL_TOOLS: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
     },
   ],
 };
+
+// Same denial, released only once `gate` resolves (the response finished streaming), or
+// after DENY_HOLD_MAX_MS as a safety net.
+const DENY_HOLD_MAX_MS = 10 * 60_000;
+function holdingDenyHooks(gate: Promise<void>): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
+  return {
+    PreToolUse: [
+      {
+        hooks: [
+          async () => {
+            let timer: NodeJS.Timeout | undefined;
+            await Promise.race([gate, new Promise<void>((r) => (timer = setTimeout(r, DENY_HOLD_MAX_MS)))]);
+            clearTimeout(timer);
+            return {
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse" as const,
+                permissionDecision: "deny" as const,
+                permissionDecisionReason: "Executed by the client.",
+              },
+            };
+          },
+        ],
+        timeout: DENY_HOLD_MAX_MS / 1000 + 60,
+      },
+    ],
+  };
+}
 
 // ---------------- shared helpers ----------------
 
@@ -603,8 +659,9 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   }
 
   const clientSystem = systemText(body.system);
-  const clientEnv = clientSystem && LOOKS_OFFICIAL.test(clientSystem.slice(0, 400))
-    ? clientEnvironment(body.messages, clientSystem) : null;
+  // A Claude Code client's own (official) system prompt.
+  const clientIsOfficial = !!clientSystem && LOOKS_OFFICIAL.test(clientSystem.slice(0, 400));
+  const clientEnv = clientIsOfficial ? clientEnvironment(body.messages, clientSystem) : null;
   const runCwd = mirroredCwd(clientEnv) ?? p.sdkCwd;
   const extraEnv: Record<string, string> = {};
   if (typeof body.max_tokens === "number" && body.max_tokens > 0) {
@@ -625,6 +682,20 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   if (NATIVE_HISTORY && last?.role === "user" && !lastHasToolResult && (!hasToolHistory || NATIVE_AFTER_TOOLS)) {
     native = normalize(body.messages, plan.toUpstream);
   }
+
+  // Session continuity (see conversationStore): a Claude Code client's main loop (tools,
+  // streamed; its tool-less side calls share the session id and stay stateless) keeps
+  // one real CLI session across requests and sends only what is new.
+  const convCandidate =
+    CONTINUITY_ENABLED && clientIsOfficial && clientTools.length > 0 && p.stream && last?.role === "user"
+      ? conversationKey(body.metadata, req.header("x-claude-code-agent-id") ?? undefined)
+      : null;
+  // Wait for this conversation's previous request to save its state (see awaitTurn);
+  // if it is still running after that, this request stays stateless.
+  const convKey = convCandidate && (await awaitTurn(convCandidate, 30_000)) ? convCandidate : null;
+  const endTurn = convKey ? beginTurn(convKey) : null;
+  const msgHashes = convKey ? body.messages.map(messageHash) : [];
+  const session = convKey ? planSession(convKey, body.messages, msgHashes, plan.toUpstream, runCwd, p.resolvedModel) : null;
 
   const acc: Acc = { blocks: [], partialJson: {}, stopReason: null, stopSequence: null, usage: {} };
   let started = false; // stream: message_start relayed
@@ -650,11 +721,26 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   // Client MCP tool definitions, part of what a prewarmed spare must match.
   const toolsSig = JSON.stringify(clientTools.map((t) => [t.name, t.description ?? "", t.input_schema ?? null]));
   let usedSpare = false;
+  let usedFallback = false;
+  let limitedError = false; // a usage/rate limit: the kept session is still valid
 
-  async function run(mode: "native" | "transcript", allowSpare = true): Promise<void> {
+  // What the CLI reported for this request's session (continuity bookkeeping).
+  let runSessionId: string | undefined;
+  let lastAssistantUuid: string | undefined;
+
+  async function run(mode: "session" | "native" | "transcript", allowSpare = true): Promise<void> {
     let content: Block[];
     let systemPrompt: string | undefined;
-    const extraOptions: Record<string, unknown> = { hooks: DENY_ALL_TOOLS };
+    // Session mode holds every denial until the whole response has streamed (deny-hold,
+    // as in meridian): the CLI fires a tool's PreToolUse as soon as that call's input is
+    // complete, so with parallel calls an immediate deny lands in the transcript BEFORE
+    // the later calls. The resume point (the last tool-call entry) would then keep that
+    // early denial and send "Executed by the client." upstream as a tool result.
+    let releaseDenies: () => void = () => {};
+    const denyGate = new Promise<void>((resolve) => (releaseDenies = resolve));
+    const extraOptions: Record<string, unknown> = {
+      hooks: mode === "session" ? holdingDenyHooks(denyGate) : DENY_ALL_TOOLS,
+    };
 
     const sysParts: string[] = [];
     if (req.keySystemPrompt) sysParts.push(req.keySystemPrompt);
@@ -664,7 +750,6 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
     // CLIENT's environment (cwd, OS, git); replacing it with this server's preset makes the
     // model work against the server's paths. So: Claude Code prompt -> used as is;
     // third-party prompt -> official preset + the prompt as a reminder.
-    const clientIsOfficial = !!clientSystem && LOOKS_OFFICIAL.test(clientSystem.slice(0, 400));
     const reminders: string[] = [];
     if (SYSTEM_PROMPT_MODE === "official") {
       if (req.keySystemPrompt) reminders.push(req.keySystemPrompt);
@@ -673,7 +758,24 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
     const reminderBlocks = (extra: string[] = []): Block[] =>
       [...extra, ...reminders].map((t) => ({ type: "text", text: `<system-reminder>\n${t}\n</system-reminder>` }));
 
-    if (mode === "native" && native) {
+    if (mode === "session" && session) {
+      // The CLI's own session, held in memorySessionStore. continue: only the new
+      // input (tool results resume at the tool-call entry, forking past the denial);
+      // rebuild: a synthetic transcript of the client history, resumed the same way;
+      // fresh: a new session.
+      content = session.kind === "fresh" ? [...reminderBlocks(), ...session.content] : session.content;
+      systemPrompt = sysParts.join("\n\n") || undefined;
+      extraOptions.persistSession = true;
+      extraOptions.sessionStore = memorySessionStore;
+      if (session.kind === "fresh") {
+        extraOptions.sessionId = session.sessionId;
+      } else {
+        await ensureFreshToken(p.sdkCwd);
+        extraOptions.resume = session.sessionId;
+        if (session.resumeAt) extraOptions.resumeSessionAt = session.resumeAt;
+        if (session.fork) extraOptions.forkSession = true;
+      }
+    } else if (mode === "native" && native) {
       if (SYSTEM_PROMPT_MODE === "official" && reminders.length) {
         native = [{ ...native[0], content: [...reminderBlocks(), ...native[0].content] }, ...native.slice(1)];
       }
@@ -735,7 +837,7 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
     // all start-up options, so the next one can claim a process started in advance.
     // Native mode resumes a session, which a spare cannot take, but it refills the pool.
     let spare: ClaimableSpare | null = null;
-    if (prewarmEnabled() && clientTools.length > 0) {
+    if (prewarmEnabled() && clientTools.length > 0 && mode !== "session") {
       const transcriptExtra: Record<string, unknown> = { hooks: DENY_ALL_TOOLS };
       if (extraOptions.systemPrompt) transcriptExtra.systemPrompt = extraOptions.systemPrompt;
       const spareParams: SdkOptionParams = { ...optionParams, extraOptions: transcriptExtra };
@@ -757,8 +859,18 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
       spare: spare ?? undefined,
     });
 
+    try {
+      await consume();
+    } finally {
+      releaseDenies();
+    }
+
+    async function consume(): Promise<void> {
     for await (const m of generator) {
       if (clientGone) break;
+      const sid = (m as { session_id?: string }).session_id;
+      if (sid && (m.type === "system" || m.type === "result")) runSessionId = sid;
+      if (m.type === "assistant" && !m.parent_tool_use_id) lastAssistantUuid = (m as { uuid?: string }).uuid ?? lastAssistantUuid;
       if (finished) continue; // drain the rest so the request log completes
       if (m.type === "system" && (m as { subtype?: string }).subtype === "init") {
         const v = (m as { claude_code_version?: string }).claude_code_version;
@@ -767,6 +879,7 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
         for (const b of plan.builtins) {
           if (!loaded.has(b) && !notBuiltin.has(b)) {
             notBuiltin.add(b);
+            saveNotBuiltin();
             console.warn(`[native] CLI does not load built-in '${b}' here; it is left out from now on`);
           }
         }
@@ -798,6 +911,7 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
 
       if (ev.type === "message_stop") {
         finished = true;
+        releaseDenies(); // every tool call is in the transcript now
         if (p.stream) {
           responded = true;
           res.end();
@@ -805,6 +919,7 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
           finishNonStream();
         }
       }
+    }
     }
   }
 
@@ -822,7 +937,14 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
     }
   };
 
-  const firstMode = native ? "native" : "transcript";
+  const firstMode = session ? "session" : native ? "native" : "transcript";
+  try {
+    await runAndRecord();
+  } finally {
+    endTurn?.();
+  }
+
+  async function runAndRecord(): Promise<void> {
   try {
     await run(firstMode);
   } catch (err) {
@@ -830,10 +952,19 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
     // intercepted tool call). That is the normal path, not a failure.
     if (!finished) {
       const nothingSent = !started && acc.blocks.length === 0;
-      if ((firstMode === "native" || usedSpare) && nothingSent && !clientGone) {
-        // Native mode failed, or a prewarmed spare refused the claim: retry cold in
-        // transcript mode (same request, nothing has reached the client yet).
-        console.warn(`[native] ${usedSpare ? "prewarmed spare" : "native mode"} failed before any output, retrying cold in transcript mode:`, (err as Error)?.message);
+      // Usage/rate limits fail the same way in any mode: report them, don't retry.
+      const limited = /hit your .{0,20}limit|usage limit|rate[ _]limit|overloaded/i.test(String((err as Error)?.message ?? ""));
+      limitedError = limited;
+      if (session && convKey && !limited) {
+        // The kept session is not trustworthy any more: forget it, rebuild next time.
+        forget(convKey);
+        dropTranscript(session.seededId);
+      }
+      if ((firstMode !== "transcript" || usedSpare) && nothingSent && !clientGone && !limited) {
+        // Session / native mode failed, or a prewarmed spare refused the claim: retry cold
+        // in transcript mode (same request, nothing has reached the client yet).
+        console.warn(`[native] ${usedSpare ? "prewarmed spare" : `${firstMode} mode`} failed before any output, retrying cold in transcript mode:`, (err as Error)?.message);
+        usedFallback = true;
         try {
           await run("transcript", false);
         } catch (err2) {
@@ -846,4 +977,99 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   }
 
   if (!finished && !clientGone && !responded) fail(new Error("Upstream ended without a complete message"));
+
+  // Continuity bookkeeping: the session now holds this request's messages plus the reply.
+  if (session && convKey && firstMode === "session") {
+    if (finished && runSessionId && !usedFallback) {
+      const toolIds = acc.blocks.filter((b) => b?.type === "tool_use").map((b) => b.id as string);
+      // saveConversation also frees the session this one forked from.
+      saveConversation(convKey, {
+        sdkSessionId: runSessionId,
+        msgHashes,
+        checkpointUuid: toolIds.length ? lastAssistantUuid : undefined,
+        pendingToolIds: toolIds.length ? toolIds : undefined,
+      });
+      if (session.seededId && session.seededId !== runSessionId) dropTranscript(session.seededId);
+      if (session.kind === "fresh") removeLocalTranscript(runSessionId);
+      if (DEBUG_CONTINUITY) {
+        console.log(`[session] ${session.kind}${session.fork ? "+fork" : ""} ${convKey.slice(0, 8)} -> ${runSessionId.slice(0, 8)} tools=${toolIds.length}`);
+      }
+    } else {
+      if (!limitedError) forget(convKey);
+      dropTranscript(session.seededId);
+    }
+  }
+  }
+}
+
+// ---------------- session continuity planning ----------------
+
+const DEBUG_CONTINUITY = process.env.DEBUG_SESSION_CONTINUITY === "true";
+
+interface SessionPlan {
+  kind: "fresh" | "continue" | "rebuild";
+  /** fresh: the id to create; continue/rebuild: the session to resume. */
+  sessionId: string;
+  resumeAt?: string;
+  fork: boolean;
+  content: Block[];
+  /** rebuild: synthetic transcript to drop once the fork exists. */
+  seededId?: string;
+}
+
+/**
+ * continue: the request extends the kept session exactly (same message prefix, then our
+ * reply, then one new user turn that answers precisely the pending tool calls, if any).
+ * Otherwise rebuild the session from the client's history (one full cache write), or
+ * start fresh when there is no history yet.
+ */
+function planSession(
+  key: string,
+  messages: Msg[],
+  hashes: string[],
+  toUpstream: Map<string, string>,
+  cwd: string,
+  model: string,
+): SessionPlan | null {
+  const st = getConversation(key);
+  if (st) {
+    const n = st.msgHashes.length;
+    const prefixOk = messages.length > n + 1 && st.msgHashes.every((h, i) => h === hashes[i]);
+    if (prefixOk && messages[n].role === "assistant") {
+      const delta = normalize(messages.slice(n + 1), toUpstream);
+      if (delta && delta.length === 1) {
+        const results = delta[0].content.filter((b) => b.type === "tool_result").map((b) => b.tool_use_id as string);
+        const pending = st.pendingToolIds ?? [];
+        const answersExactly = pending.length
+          ? pending.length === results.length && pending.every((id) => results.includes(id)) && !!st.checkpointUuid
+          : results.length === 0;
+        if (answersExactly) {
+          return {
+            kind: "continue",
+            sessionId: st.sdkSessionId,
+            resumeAt: pending.length ? st.checkpointUuid : undefined,
+            fork: pending.length > 0,
+            content: delta[0].content,
+          };
+        }
+      }
+    }
+    if (DEBUG_CONTINUITY) console.log(`[session] ${key.slice(0, 8)}: history does not extend the kept session, rebuilding`);
+  }
+  const all = normalize(messages, toUpstream);
+  if (!all) return null;
+  const history = all.slice(0, -1);
+  const content = all[all.length - 1].content;
+  if (history.length === 0) return { kind: "fresh", sessionId: randomUUID(), fork: false, content };
+  const seed = randomUUID();
+  const entries = buildEntries(history, seed, cwd, model);
+  seedTranscript(seed, entries as Array<{ type: string; [k: string]: unknown }>);
+  return {
+    kind: "rebuild",
+    sessionId: seed,
+    resumeAt: entries[entries.length - 1].uuid as string,
+    fork: true,
+    content,
+    seededId: seed,
+  };
 }

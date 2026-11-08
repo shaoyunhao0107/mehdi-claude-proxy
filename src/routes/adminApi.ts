@@ -8,6 +8,7 @@ import { getDiscoveryStatus, refreshModels } from "../services/modelDiscovery.js
 import { versionInfo } from "./anthropicNative.js";
 import { concurrencyStatus } from "../middleware/concurrency.js";
 import { spareStatus } from "../services/sparePool.js";
+import { continuityStatus } from "../services/conversationStore.js";
 
 const router = Router();
 
@@ -33,6 +34,7 @@ router.get("/status", (_req, res) => {
     clientVersionsSeen: Object.fromEntries(versionInfo.clients),
     concurrency: concurrencyStatus(),
     prewarm: spareStatus(),
+    sessions: continuityStatus(),
     today: getStats(`${today} 00:00:00`),
   });
 });
