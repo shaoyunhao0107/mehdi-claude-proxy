@@ -4,7 +4,8 @@ import type { Request, Response } from "express";
 import { sendClassifiedError } from "../services/errorClassifier.js";
 import { trackedQuery } from "../services/sdkBridge.js";
 import { cancelTask } from "../services/taskTracker.js";
-import { AVAILABLE_MODELS, resolveModel } from "../models.js";
+import { resolveModel } from "../models.js";
+import { getModels } from "../services/modelDiscovery.js";
 import {
   buildToolBridge,
   rewriteBlocksForClient,
@@ -92,6 +93,8 @@ function buildPromptFromTranslated(
 
 // GET /v1/models
 router.get("/models", (_req, res) => {
+  // Local patch: list discovered from the subscription (services/modelDiscovery.ts).
+  const AVAILABLE_MODELS = getModels();
   res.json({
     object: "list",
     // Local patch: fields for both OpenAI (object/owned_by/created) and Anthropic

@@ -2,6 +2,10 @@ import { PORT } from "./config.js";
 // Importing connection module triggers DB init + migrations
 import "./db/connection.js";
 import { app } from "./app.js";
+import { startModelDiscovery } from "./services/modelDiscovery.js";
+
+// Local patch: discover available models in the background.
+startModelDiscovery();
 
 app.listen(PORT, () => {
   console.log(`Claude Code OpenAI-compatible API server running on port ${PORT}`);

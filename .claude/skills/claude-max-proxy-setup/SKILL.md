@@ -124,7 +124,15 @@ curl -s -X DELETE -H "Authorization: Bearer $S" http://127.0.0.1:3457/api/admin/
 
 - 启动时提示 "claude.ai connectors are disabled" 是正常的：用了自定义地址就不加载 claude.ai 连接器。
 - 可以用 `ANTHROPIC_MODEL` 固定模型；没识别的模型名会原样传给上游。
-- `/v1/models` 返回 Max 套餐实际能用的模型（2026-11 实测）：`claude-opus-5-5`、`claude-sonnet-5-5`、`claude-haiku-5-5`、`claude-opus-4-6`、`claude-sonnet-4-6`、`claude-haiku-4-5`。`claude-fable-5-1` 要另外购买 usage credits，不走套餐额度，所以没列出来。列表在 `src/models.ts` 里改。
+- `/v1/models` 的列表是**自动发现**的（`src/services/modelDiscovery.ts`），新模型出来后会自动加进去：
+  1. 用官方 CLI 的 `supportedModels()` 取每个系列的最新版（例如 opus → `claude-opus-5-5`）。这一步只用 CLI 本地的信息，不发对话请求，大约 1 秒。
+  2. 以每个最新版为中心探测一批版本号：当前大版本往下所有小版本、往上 2 个小版本、下一个大版本的 x-0、上一个大版本的 0–9。探测是发一句 "hi"：不存在的模型直接报 "may not exist"，不花额度；存在的模型大约花 600 tokens。
+  3. 结果缓存在 `data/models.json`，每个 ID 隔 `MODEL_REPROBE_DAYS`（默认 7 天）重新探测一次，用来发现模型下线。每 `MODEL_REFRESH_HOURS`（默认 24 小时）整体刷新一次。第一次完整探测约 3.5 分钟（72 个候选），之后的日常刷新大约 1 秒。
+  4. **必须串行探测**：每次探测都是一个 CLI 进程，并行跑在 8 GB 的机器上会内存耗尽（"memory allocation failed"）。
+  5. 要另外购买 usage credits 的模型（例如 `claude-fable-5-1`）标记为 `paid`，默认不列出；设 `INCLUDE_PAID_MODELS=true` 可以列出来。
+  - 2026-11 的实测结果：opus 5.5 / 4.8 / 4.7 / 4.6 / 4.5 / 4.1 / 4.0，sonnet 5.5 / 4.6 / 4.5，haiku 5.5 / 4.5。
+  - 手动刷新和查看（只能本机访问）：`POST /api/admin/models/refresh`（加 `?full=1` 是全部重新探测），`GET /api/admin/models`。
+  - 局限：如果出现一个**全新的系列名**（像当初的 fable），而本机 SDK 自带的 CLI 太旧不认识，第 1 步就发现不了它，要升级 SDK（见"同步上游更新"）。同一系列的新版本靠第 2 步的"往上探测"也能发现。
 - Cherry Studio 等聊天客户端：选 Anthropic 类型，地址填 `http://<服务器>:3457`，key 同上。思考开关、图片、流式都支持。
 - 接口是 HTTP 明文，key 可能被截获。不放心就用 SSH 隧道（`ssh -L 3457:127.0.0.1:3457 user@server`，客户端填 `http://127.0.0.1:3457`），或者在前面加 HTTPS 反代。
 
@@ -157,7 +165,7 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
    - 新版 SDK 跑到 maxTurns 上限时会抛 `error_max_turns` 异常。如果已经截获到 tool_use，就忽略这个异常，否则会变成 500。
    - SDK 的 `cwd` 指向空目录 `data/sdk-cwd`（可以用 `SDK_CWD` 环境变量覆盖），防止模型看到代理自己的路径、跑去那里找文件。
 4. `src/middleware/adminAuth.ts`：管理接口只允许 127.0.0.1 / ::1 访问。
-5. `src/models.ts` / `src/routes/proxy.ts`：模型列表换成 Max 套餐实际能用的模型，`/v1/models` 同时带上 OpenAI 和 Anthropic 两种格式的字段。
+5. 新增 `src/services/modelDiscovery.ts`，自动发现模型（见客户端配置一节）。`src/routes/proxy.ts` 的 `/v1/models` 改用它，同时带上 OpenAI 和 Anthropic 两种格式的字段。`src/server.ts` 启动时开始发现流程，`src/routes/adminApi.ts` 加了 `/models` 和 `/models/refresh` 两个接口。
 6. 新增 `scripts/install-windows.ps1`、`scripts/start-public.ps1` 和本 skill。
 
 ## 同步上游更新
@@ -186,6 +194,8 @@ npm install && npm run build                       # Windows 记得先重新放�
 | 一句"你好"就花上万 tokens，或者模型提到服务器上的文件、工具 | 补丁 2 的 `tools: []` 默认值丢了 |
 | 客户端开了思考却看不到思考内容 | 补丁 3：`thinking` 在校验阶段被删了，或者没映射成 `adaptive` + `display: summarized`（CLI 会忽略固定预算） |
 | 抓客户端原始请求 | 在本机起一个转发代理，把请求体 dump 下来再转给 3457，用来对比 Claude Code 发了哪些新字段 |
+| 模型列表缺了某个模型 | 先看 `GET /api/admin/models` 里对应 ID 的 `status`，再 `POST /api/admin/models/refresh?full=1` 重新探测。`error` 状态是临时失败（限流、网络），下次刷新会自动重试 |
+| 模型探测报 "memory allocation failed" | 有探测在并行跑，内存不够。确认 `refreshModels` 是串行的；也可能是同时进来的请求太多 |
 | 看代理发给 Anthropic 的实际请求 | 另起一个测试实例，设 `ANTHROPIC_BASE_URL=http://127.0.0.1:<录制端口>`，录制程序记下请求（把 authorization 打码）后转发到 `api.anthropic.com` |
 
 日志在 `proxy.log`（Windows 上是 UTF-16 编码，用 `Get-Content` 看）。请求记录在 `data/proxy.db` 的 `request_log` 表。

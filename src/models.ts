@@ -18,7 +18,7 @@ export const MODEL_MAP: Record<string, string> = {
   "nomic-embed-text": "nomic-embed-text",
 };
 
-// Local patch: only real Claude models available on a Max plan (verified 2026-11-07).
+// Local patch: no longer served by /v1/models (see services/modelDiscovery.ts); kept for reference.
 // GPT / embedding aliases still resolve via MODEL_MAP but are not advertised.
 // claude-fable-5-1 is omitted: it needs separate usage credits, not plan quota.
 export const AVAILABLE_MODELS = [

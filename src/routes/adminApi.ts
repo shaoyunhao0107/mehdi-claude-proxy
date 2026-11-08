@@ -4,11 +4,23 @@ import { listTasks, cancelTask } from "../services/taskTracker.js";
 import { queryHistory, getStats, getRequestDetail } from "../services/historyService.js";
 import { getTokenStatus, setSetting, deleteSetting } from "../services/settingsService.js";
 import { adminAuth } from "../middleware/adminAuth.js";
+import { getDiscoveryStatus, refreshModels } from "../services/modelDiscovery.js";
 
 const router = Router();
 
 // All admin routes require admin auth
 router.use(adminAuth);
+
+// --- Model discovery (local patch) ---
+router.get("/models", (_req, res) => {
+  res.json(getDiscoveryStatus());
+});
+
+// POST /api/admin/models/refresh[?full=1] - re-run discovery; waits for it to finish.
+router.post("/models/refresh", async (req, res) => {
+  await refreshModels(req.query.full === "1" || req.query.full === "true");
+  res.json(getDiscoveryStatus());
+});
 
 // --- API Keys ---
 
