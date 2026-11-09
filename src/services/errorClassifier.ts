@@ -57,6 +57,12 @@ export function classifyUpstreamError(err: unknown, now: Date = new Date()): Cla
   const message = upstream || base;
   const haystack = `${base}\n${upstream}`;
 
+  // A model the plan does not include ("Fable 5.1 requires usage credits"): not retryable.
+  // Checked first: the CLI's text links to a "...limit_message" page.
+  if (/requires (usage )?credits/i.test(haystack)) {
+    return { status: 402, type: "billing_error", message };
+  }
+
   if (/out of (extra )?usage|usage limit|rate[ _-]?limit|too many requests|\b429\b/i.test(haystack)) {
     return {
       status: 429,

@@ -1240,8 +1240,8 @@ ${t}
     // intercepted tool call). That is the normal path, not a failure.
     if (!finished) {
       const nothingSent = !started && acc.blocks.length === 0;
-      // Usage/rate limits fail the same way in any mode: report them, don't retry.
-      const limited = /hit your .{0,20}limit|usage limit|rate[ _]limit|overloaded/i.test(String((err as Error)?.message ?? ""));
+      // Usage/rate limits (and models the plan lacks) fail the same way in any mode: report, don't retry.
+      const limited = /hit your .{0,20}limit|usage limit|rate[ _]limit|overloaded|requires (usage )?credits/i.test(String((err as Error)?.message ?? ""));
       limitedError = limited;
       if (session && convKey && !limited) {
         // The kept session is not trustworthy any more: forget it, rebuild next time.

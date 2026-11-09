@@ -5,10 +5,14 @@
 // 2. Probe a grid of version ids around each latest model (older minors, the previous
 //    major, and a few "next" versions) with a tiny one-word request. Unknown ids fail
 //    with "may not exist" before any tokens are billed; real ones cost ~600 tokens once.
-// Results are cached in data/models.json; each id is re-probed after REPROBE_DAYS.
+// Results are cached in data/models.json; each id is re-probed after REPROBE_DAYS, ids
+// that need paid credits on every refresh (a plan upgrade may include them), and all of
+// them at once when the login's plan or organization changes (e.g. Pro -> Max).
 // Probes run one at a time: every probe is a CLI process and parallel ones exhaust RAM.
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { createHash } from "crypto";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
+import { homedir } from "os";
 import { dirname, resolve } from "path";
 
 type Status = "ok" | "missing" | "paid" | "error";
@@ -20,6 +24,7 @@ interface ProbeEntry {
 interface Cache {
   updatedAt: string | null;
   latest: Record<string, string>; // family -> latest model id (from supportedModels)
+  account?: string; // plan + organization of the login the probes were made with
   probes: Record<string, ProbeEntry>;
 }
 export interface DiscoveredModel {
@@ -98,8 +103,8 @@ function quietEnv(extra: Record<string, string> = {}): Record<string, string> {
   };
 }
 
-/** Latest model per family from the CLI's model picker (no inference call). */
-async function fetchLatest(): Promise<Record<string, string>> {
+/** Latest model per family from the CLI's model picker (no inference call), and the login. */
+async function fetchLatest(): Promise<{ latest: Record<string, string>; account: string }> {
   const ac = new AbortController();
   async function* idle(): AsyncGenerator<never> {
     await new Promise<void>((r) => ac.signal.addEventListener("abort", () => r()));
@@ -110,13 +115,18 @@ async function fetchLatest(): Promise<Record<string, string>> {
   });
   try {
     const list = await q.supportedModels();
+    const info = await q.accountInfo().catch(() => ({}) as Record<string, string | undefined>);
+    // Only a digest is kept: enough to notice another plan or account, nothing readable.
+    const account = createHash("sha256")
+      .update([info.subscriptionType, info.organization, info.email, info.apiProvider].join("|"))
+      .digest("hex").slice(0, 16) + `:${info.subscriptionType ?? "?"}`;
     const latest: Record<string, string> = {};
     for (const m of list) {
       const id = (m.resolvedModel ?? m.value).replace(/\[.*\]$/, "");
       const fm = ID_RE.exec(id);
       if (fm && !latest[fm[1]]) latest[fm[1]] = id;
     }
-    return latest;
+    return { latest, account };
   } finally {
     ac.abort();
     try { q.close(); } catch { /* already closed */ }
@@ -167,7 +177,7 @@ async function probe(id: string): Promise<ProbeEntry> {
 
 function due(id: string, full: boolean): boolean {
   const p = cache.probes[id];
-  if (!p || full || p.status === "error") return true;
+  if (!p || full || p.status === "error" || p.status === "paid") return true;
   return Date.now() - Date.parse(p.at) > REPROBE_DAYS * 86400_000;
 }
 
@@ -177,9 +187,14 @@ export function refreshModels(full = false): Promise<void> {
   running = (async () => {
     const t0 = Date.now();
     try {
-      const latest = await fetchLatest();
+      const { latest, account } = await fetchLatest();
       if (Object.keys(latest).length === 0) throw new Error("supportedModels() returned no Claude ids");
       cache.latest = latest;
+      if (cache.account && cache.account !== account) {
+        console.log(`[models] login changed (${cache.account.split(":")[1]} -> ${account.split(":")[1]}), re-probing everything`);
+        full = true;
+      }
+      cache.account = account;
 
       const ids = new Set<string>();
       for (const [family, id] of Object.entries(latest)) for (const c of candidates(family, id)) ids.add(c);
@@ -213,4 +228,16 @@ export function startModelDiscovery(): void {
   mkdirSync(SDK_CWD, { recursive: true });
   setTimeout(() => void refreshModels(false), 20_000).unref();
   setInterval(() => void refreshModels(false), REFRESH_HOURS * 3600_000).unref();
+  // A new login (another plan or account) rewrites the CLI's credentials file: refresh
+  // within the hour instead of waiting for the daily run. Only the file's time is read.
+  const cred = resolve(process.env.CLAUDE_CONFIG_DIR || resolve(homedir(), ".claude"), ".credentials.json");
+  const mtime = () => { try { return statSync(cred).mtimeMs; } catch { return 0; } };
+  let seen = mtime();
+  setInterval(() => {
+    const now = mtime();
+    if (now !== seen) {
+      seen = now;
+      void refreshModels(false);
+    }
+  }, 3600_000).unref();
 }

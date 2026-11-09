@@ -239,6 +239,11 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
     - 续接不再分叉：每轮工具调用结束后，`scrubDenials` 把钩子生成的拒绝记录（`PreToolUse:… hook error: Executed by the client.`）以及挂在它们后面的附加信息，从代理保存的会话记录里删掉。会话就停在工具调用上，下一个请求用 `resumeSessionAt`（上一轮最后一条回复）在同一个会话里接上真实结果。撤回也是在同一个会话里从检查点开分支，和直接用时撤回的做法一样。不清理的话，不分叉续接会把拒绝记录也带上去。
     - 会话 ID：Claude Code 主对话直接用**客户端自己的会话 ID**，上游看到的和客户端直接登录时发出的完全一样。客户端就在本机时（`~/.claude/projects/*/<ID>.jsonl` 或 `~/.claude/sessions/*.json` 里已有这个 ID）改用新生成的 ID，否则 CLI 会报 "Session ID … is already in use"。第三方客户端和子代理在新建时生成一个，之后不变。
     - 附带的好处：不再每轮复制一份整个会话，`data/sessions` 里一个对话只有一个文件。
+23. **换套餐、出新模型时模型列表自动跟上**（2026-11-09；这台服务器当前登录的是 **Pro**，Fable 5.1 要额外付费额度）：
+    - `modelDiscovery` 每次刷新都用 SDK 的 `accountInfo()` 记下登录的套餐和组织（只存摘要和套餐名）。换了套餐或换了账号（比如 Pro 升 Max）就把所有模型全部重测一遍。需要付费额度（`paid`）的模型每次刷新都重测，不再等 7 天。
+    - 每小时看一下 `~/.claude/.credentials.json` 的修改时间（只看时间，不读内容）。重新登录后一小时内就会刷新，不用等每天一次的定时刷新。也可以手动刷新：`POST /api/admin/models/refresh?full=1`（仅限本机）。
+    - 新模型：`supportedModels()` 来自官方 CLI 的模型选择器，SDK 更新后新模型会自动出现，并且会探测下一个版本号。请求里的模型名不会被拦，客户端直接填新模型 ID 也能用。
+    - 套餐不包含的模型（"requires usage credits"）返回 **402 billing_error**，以前返回 500，Claude Code 会重试最多 10 次。也不再退回 transcript 模式重试，上游只发一次。
 
 ## 同步上游更新
 
