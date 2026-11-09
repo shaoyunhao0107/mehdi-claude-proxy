@@ -3,6 +3,12 @@
 # If the check fails, the previous SDK version is put back.
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\update-sdk.ps1 [-Version 0.3.330] [-Port 3457] [-TestModel claude-haiku-5-5] [-SkipTest]
+#   powershell -ExecutionPolicy Bypass -File scripts\update-sdk.ps1 -MatchClient
+#
+# -MatchClient: install the SDK whose CLI has the version of the Claude Code client that
+# last used the proxy from another machine (read from the audit log), up or down. The
+# client's system prompt is forwarded as is, so upstream should see one version in both.
+# Every switch runs the unit tests (npm test, no API calls) before the restart.
 #
 # When: the proxy log says a client is newer ("run scripts/update-sdk.ps1"), or
 # GET /api/admin/status shows sdk.updateAvailable. Not automatic on purpose: a new CLI can
@@ -12,7 +18,8 @@ param(
     [int]$Port = 3457,
     [string]$TaskName = "mehdi-claude-proxy",
     [string]$TestModel = "claude-haiku-5-5",
-    [switch]$SkipTest
+    [switch]$SkipTest,
+    [switch]$MatchClient
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
@@ -38,10 +45,34 @@ function Install-Sdk([string]$v) {
     if ($LASTEXITCODE -ne 0) { throw "npm install $v failed" }
     npm run build
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
+    npm test
+    if ($LASTEXITCODE -ne 0) { throw "unit tests failed" }
+}
+function Remote-ClientVersion {
+    # The newest request with a Claude Code user agent from a non-loopback address (last 7 days).
+    $best = $null
+    Get-ChildItem "$root\data\audit\*.jsonl" -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 7 | ForEach-Object {
+        foreach ($line in [IO.File]::ReadLines($_.FullName)) {
+            if ($line -notmatch '"user-agent":"claude-cli/(\d+\.\d+\.\d+)') { continue }
+            $v = $Matches[1]
+            if ($line -match '"ip":"(::1|127\.|::ffff:127\.)') { continue }
+            if ($line -notmatch '^\{"id":"[^"]*","t":"([^"]+)"') { continue }
+            if (-not $best -or $Matches[1] -gt $best.t) { $best = @{ t = $Matches[1]; v = $v } }
+        }
+    }
+    return $best
 }
 
 $old = Installed
-$target = (npm view "@anthropic-ai/claude-agent-sdk@$Version" version | Select-Object -Last 1).Trim()
+if ($MatchClient) {
+    $c = Remote-ClientVersion
+    if (-not $c) { "no Claude Code request from another machine in data\audit; nothing to match"; exit 1 }
+    $Version = $c.v -replace '^2\.1\.', '0.3.'
+    "remote client: Claude Code $($c.v) (last request $($c.t)) -> SDK $Version"
+}
+$target = (npm view "@anthropic-ai/claude-agent-sdk@$Version" version | Select-Object -Last 1)
+if (-not $target) { "SDK $Version is not on npm"; exit 1 }
+$target = $target.Trim()
 "installed SDK $old, target $target"
 if ($target -eq $old) { "already on $target"; exit 0 }
 
@@ -58,7 +89,13 @@ if ($SkipTest) { "test skipped"; exit 0 }
 $key = (Get-Content "$root\.home-key" -TotalCount 1).Trim()
 $bash = "$env:ProgramFiles\Git\bin\bash.exe"
 "running the two-prompt regression check ($TestModel)"
+# The e2e script needs a real python on PATH (from PowerShell, "python" may be the Store alias).
+$py = Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe", "$env:ProgramFiles\Python3*\python.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($py) { $env:PATH = "$($py.DirectoryName);$env:PATH" }
+# Its stderr must not abort this script (that would skip the rollback below).
+$ErrorActionPreference = "Continue"
 $out = & $bash "scripts/e2e-two-prompts.sh" "http://127.0.0.1:$Port" $key $TestModel 2>&1 | Out-String
+$ErrorActionPreference = "Stop"
 $out
 $ok = ($out -match "q2\s+result: done") -and ($out -match "5\s*\r?\n?\s*6\s*\r?\n?\s*3|5 6 3|sub\(5,\s*2\)\s*=?\s*3")
 if (-not $ok) {

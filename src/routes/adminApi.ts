@@ -11,6 +11,7 @@ import { spareStatus } from "../services/sparePool.js";
 import { continuityStatus } from "../services/conversationStore.js";
 import { sdkVersionStatus } from "../services/sdkVersion.js";
 import { warmStatus } from "../services/warmSessions.js";
+import { memoryStatus } from "../services/memoryGuard.js";
 
 const router = Router();
 
@@ -34,11 +35,17 @@ router.get("/status", (_req, res) => {
   res.json({
     serverCliVersion: versionInfo.serverCli(),
     clientVersionsSeen: Object.fromEntries(versionInfo.clients),
+    // Upstream sees the client's prompt text with the server CLI's version: keep them equal.
+    versionAlignment: (() => {
+      const client = versionInfo.remoteClient();
+      return { serverCli: versionInfo.serverCli(), remoteClient: client, aligned: client === null ? null : client === versionInfo.serverCli() };
+    })(),
     concurrency: concurrencyStatus(),
     prewarm: spareStatus(),
     sessions: continuityStatus(),
     sdk: sdkVersionStatus(),
     warmSessions: warmStatus(),
+    memory: memoryStatus(),
     today: getStats(`${today} 00:00:00`),
   });
 });

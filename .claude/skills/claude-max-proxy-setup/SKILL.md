@@ -251,6 +251,13 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
     - 审计日志的 `upstream.sessionId` 记录 CLI 实际发出的会话 ID，验证时看这一项。设 `SHARE_SESSION_ID=false` 可以退回旧行为（各用各的 ID）。
     - 试过但不行：resume 一个只有 session-owner 记录、没有消息的会话，CLI 会报 "No conversation found"。
 
+25. **服务器 CLI 版本跟家里客户端对齐**（2026-11-09）：客户端的系统提示原样转发，而工具定义和 User-Agent 来自服务器的 CLI。两边版本不一样时，上游看到的是"2.1.317 的提示词 + 2.1.319 的 CLI"，直接使用时不会出现这种组合。所以服务器的 CLI 要和客户端版本相同，**不是**越新越好。
+    - `scripts/update-sdk.ps1 -MatchClient`：从审计日志里找最近一个来自其他机器（非 127.0.0.1）的 Claude Code 请求，取它的版本（2.1.N 对应 SDK 0.3.N），往上或往下切换到这个版本。家里 Claude Desktop 升级后跑一次。2026-11-09 已从 0.3.319 降到 0.3.317，和家里的 2.1.317 一致。
+    - `GET /api/admin/status` 新增 `versionAlignment: {serverCli, remoteClient, aligned}`。远程客户端版本和服务器不一致时（不论哪边新），日志都会出现 `[version]` 警告。npm 上有新 SDK 只作提示，不作为升级的理由。
+    - 脚本修复：从 PowerShell 调 bash 时，`python` 会解析成 Microsoft Store 的占位程序，加上 stderr 在 `$ErrorActionPreference=Stop` 下会中断脚本，回归测试和回滚都被跳过。现在会把真实的 Python 加进 PATH，调用 bash 时临时改成 Continue。
+26. **内存保护**（`src/services/memoryGuard.ts`）：空闲内存减去一个 CLI（约 250 MB）后低于 `MIN_FREE_MEMORY_MB`（默认 1024）时，不再预启动下一个请求（warmSessions）和备用进程（sparePool），并先关掉最老的预热进程和所有备用进程。正常请求不受影响，只是改为冷启动。状态在 `/api/admin/status` 的 `memory` 字段，包括被跳过的次数。服务器总内存 7.9 GB，平时空闲 1.5–2 GB。
+27. **单元测试**（`npm test`，不调用 API，不花额度，约 2 秒）：用 `node --test` 加 tsx，`tests/setup.ts` 先把数据库、sessions、审计日志、`CLAUDE_CONFIG_DIR` 都指向临时目录。覆盖的内容：会话 ID 怎么选（客户端自己的 ID、本机已被占用的 ID、子代理用父会话的 ID、主请求还没保存时来的子代理）、续接不分叉、子代理新建会话或被 forget 时**不能删掉父对话的记录**（做过变异测试：把 `dropTranscript(storeId)` 改成 `dropTranscript(id)`，测试会失败）、storeFor 映射、scrubDenials、新建会话的锁、错误分类（402/429/401）、内存保护。`update-sdk.ps1` 每次切换版本都会先跑一遍。改动会话相关代码后先跑 `npm test`，再跑 e2e。内部函数通过 `anthropicNative.ts` 末尾的 `__test` 导出。
+
 ## 同步上游更新
 
 ```bash
@@ -259,7 +266,7 @@ git fetch upstream && git merge upstream/master    # 冲突时以保留上面的
 npm install && npm run build                       # Windows 记得先重新放行 better-sqlite3
 ```
 
-客户端（家里的 Claude Code / Claude Desktop）升级后，运行 `powershell -ExecutionPolicy Bypass -File scripts/update-sdk.ps1` 把 SDK 跟上，脚本自带回归测试和回滚（见补丁 17）。服务器自己装的 `claude` 和代理无关。
+客户端（家里的 Claude Code / Claude Desktop）升级后，运行 `powershell -ExecutionPolicy Bypass -File scripts/update-sdk.ps1 -MatchClient` 把服务器的 CLI 对齐到客户端的版本，脚本自带单元测试、回归测试和回滚（见补丁 17、25）。服务器自己装的 `claude` 和代理无关。
 改完重启服务（Windows：`Stop-ScheduledTask` 再 `Start-ScheduledTask`，或者直接结束 node 进程，循环会自动拉起），然后重跑"验证"。
 
 ## 排错

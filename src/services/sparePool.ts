@@ -10,6 +10,7 @@
 import { prewarm } from "@anthropic-ai/claude-agent-sdk";
 import { createHash } from "crypto";
 import { buildSdkOptions, type ClaimableSpare, type SdkOptionParams } from "./sdkBridge.js";
+import { tooLowForEarlyStart } from "./memoryGuard.js";
 
 const ENABLED = process.env.PREWARM !== "false";
 const MAX_SPARES = Math.max(1, parseInt(process.env.PREWARM_MAX_SPARES || "2", 10));
@@ -63,6 +64,10 @@ export async function takeSpare(key: string): Promise<ClaimableSpare | null> {
 /** Start a spare for `key` in the background unless one is already parked. */
 export function ensureSpare(key: string, params: () => SdkOptionParams): void {
   if (!ENABLED || pool.has(key)) return;
+  if (tooLowForEarlyStart("a spare CLI")) {
+    for (const [k, e] of [...pool.entries()]) discard(k, e); // parked spares go first
+    return;
+  }
   while (pool.size >= MAX_SPARES) {
     const [oldKey, old] = pool.entries().next().value as [string, Entry];
     discard(oldKey, old);

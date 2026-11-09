@@ -48,7 +48,9 @@ async function check(): Promise<void> {
     status.checkedAt = new Date().toISOString();
     status.updateAvailable = newer(v, status.installedSdk);
     if (status.updateAvailable) {
-      console.log(`[version] Agent SDK ${v} (CLI ${status.latestCli}) is available; installed ${status.installedSdk}. Run scripts/update-sdk.ps1`);
+      // Not a reason to update by itself: the CLI should equal the clients' version (their
+      // system prompt is forwarded as is), so follow them with update-sdk.ps1 -MatchClient.
+      console.log(`[version] Agent SDK ${v} (CLI ${status.latestCli}) is on npm; installed ${status.installedSdk}. Update when the clients do (scripts/update-sdk.ps1 -MatchClient)`);
     }
   } catch {
     /* offline: try again tomorrow */

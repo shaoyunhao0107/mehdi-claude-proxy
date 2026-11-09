@@ -107,17 +107,44 @@ let CLI_VERSION = bundledSdkVersion().replace(/^0\.3\./, "2.1.");
 // A Claude Code client's system prompt is forwarded as is, while upstream sees this
 // server's CLI version: different versions mean prompt text and version header disagree.
 const warnedClientVersions = new Set<string>();
-export const versionInfo = { serverCli: () => CLI_VERSION, clients: new Map<string, string>() };
+export interface ClientVersionSeen {
+  lastSeen: string;
+  requests: number;
+  /** Requests from another machine (home), not from a test client on this server. */
+  remoteRequests: number;
+  lastRemote?: string;
+}
+export const versionInfo = {
+  serverCli: () => CLI_VERSION,
+  clients: new Map<string, ClientVersionSeen>(),
+  /** The Claude Code version the latest request from another machine came from. */
+  remoteClient(): string | null {
+    let best: [string, string] | null = null;
+    for (const [v, c] of versionInfo.clients) if (c.lastRemote && (!best || c.lastRemote > best[1])) best = [v, c.lastRemote];
+    return best?.[0] ?? null;
+  },
+};
+const isLoopback = (ip: string | undefined) => !ip || /^(::1|127\.|::ffff:127\.)/.test(ip);
 function checkClientVersion(req: Request): void {
   const m = /^claude-cli\/(\d+\.\d+\.\d+)/.exec(String(req.headers["user-agent"] ?? ""));
   if (!m) return;
-  versionInfo.clients.set(m[1], new Date().toISOString());
-  if (m[1] !== CLI_VERSION && !warnedClientVersions.has(m[1])) {
+  const now = new Date().toISOString();
+  const remote = !isLoopback(req.ip ?? req.socket?.remoteAddress);
+  const c = versionInfo.clients.get(m[1]) ?? { lastSeen: now, requests: 0, remoteRequests: 0 };
+  c.lastSeen = now;
+  c.requests++;
+  if (remote) {
+    c.remoteRequests++;
+    c.lastRemote = now;
+  }
+  versionInfo.clients.set(m[1], c);
+  if (remote && m[1] !== CLI_VERSION && !warnedClientVersions.has(m[1])) {
     warnedClientVersions.add(m[1]);
     console.warn(
       `[version] client Claude Code ${m[1]} differs from this server's CLI ${CLI_VERSION}. ` +
-        `Its system prompt is forwarded as is, so keep both on the same version` +
-        (clientIsAhead(m[1]) ? ` (the client is newer: run scripts/update-sdk.ps1).` : `.`),
+        `Its system prompt is forwarded as is, so upstream sees prompt text of ${m[1]} from CLI ${CLI_VERSION}: ` +
+        `align with scripts/update-sdk.ps1 -MatchClient` +
+        (clientIsAhead(m[1]) ? ` (the client is newer).` : ` (the server is newer).`),
     );
   }
 }
@@ -1518,3 +1545,6 @@ function planSession(
     content,
   };
 }
+
+/** Internals for the unit tests in tests/ (not used by the server). */
+export const __test = { planSession, normalize };

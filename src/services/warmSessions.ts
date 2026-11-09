@@ -14,6 +14,7 @@
 import { startup, type WarmQuery } from "@anthropic-ai/claude-agent-sdk";
 import { createHash } from "crypto";
 import { buildSdkOptions, type SdkOptionParams } from "./sdkBridge.js";
+import { tooLowForEarlyStart } from "./memoryGuard.js";
 
 const ENABLED = process.env.WARM_SESSIONS !== "false";
 const MAX = Math.max(1, parseInt(process.env.WARM_SESSION_MAX || "4", 10));
@@ -90,6 +91,12 @@ export function warmNext(
 ): void {
   if (!ENABLED) return;
   dropWarm(conv);
+  if (tooLowForEarlyStart("the next request")) {
+    // Low on memory: also close the oldest warm process (its request starts cold).
+    const oldest = byConversation.entries().next().value as [string, Entry] | undefined;
+    if (oldest) discard(oldest[0], oldest[1]);
+    return;
+  }
   while (byConversation.size >= MAX) {
     const [oldConv, old] = byConversation.entries().next().value as [string, Entry];
     discard(oldConv, old);
