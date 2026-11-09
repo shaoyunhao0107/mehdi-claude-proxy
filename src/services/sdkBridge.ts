@@ -49,6 +49,8 @@ interface TrackedQueryParams extends SdkOptionParams {
   apiKeyId: number | null;
   apiKeyName: string | null;
   spare?: ClaimableSpare;
+  /** A process started early with startup() for exactly these options (warmSessions). */
+  warm?: { query: { query(prompt: string | AsyncIterable<SDKUserMessage>): Query }; stderrSink: { fn?: (d: string) => void } };
 }
 
 // Local patch: env applied to every SDK subprocess. Skips the session-title call,
@@ -63,6 +65,11 @@ const QUIET_ENV: Record<string, string> = {
   // This server account's claude.ai connectors (e.g. Claude Docs) must not be loaded:
   // a prewarmed CLI otherwise attaches their tools and instructions to every request.
   ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+  // The client owns compaction: it decides when to compact, and the proxy rebuilds the
+  // session from the compacted history it then sends. A server-side auto-compaction would
+  // summarise behind the client's back (an extra billed call, two diverging histories).
+  // Manual compaction requests from the client still pass through as ordinary requests.
+  DISABLE_AUTO_COMPACT: "1",
 };
 
 interface TrackedQueryResult {
@@ -152,7 +159,10 @@ export function trackedQuery(params: TrackedQueryParams): TrackedQueryResult {
   // minus cwd/model; claiming it skips process start-up. A refused claim surfaces as an
   // error result before any output, and the caller retries cold.
   let sdkQuery: Query;
-  if (params.spare) {
+  if (params.warm) {
+    params.warm.stderrSink.fn = onStderr;
+    sdkQuery = params.warm.query.query(params.prompt);
+  } else if (params.spare) {
     params.spare.stderrSink.fn = onStderr;
     sdkQuery = params.spare.process.claim({
       prompt: params.prompt,

@@ -10,6 +10,7 @@ import { concurrencyStatus } from "../middleware/concurrency.js";
 import { spareStatus } from "../services/sparePool.js";
 import { continuityStatus } from "../services/conversationStore.js";
 import { sdkVersionStatus } from "../services/sdkVersion.js";
+import { warmStatus } from "../services/warmSessions.js";
 
 const router = Router();
 
@@ -37,6 +38,7 @@ router.get("/status", (_req, res) => {
     prewarm: spareStatus(),
     sessions: continuityStatus(),
     sdk: sdkVersionStatus(),
+    warmSessions: warmStatus(),
     today: getStats(`${today} 00:00:00`),
   });
 });

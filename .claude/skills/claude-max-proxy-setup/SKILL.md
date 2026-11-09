@@ -222,6 +222,8 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
 15. **子代理和 PowerShell**：CLI 的初始化消息里，Agent 工具用的是内部名字 `Task`（发给上游的仍是 `Agent`）。以前自动学习拿 `Agent` 去比，误判成"不加载"，把子代理从工具列表里删了；现在按 `TOOL_ALIASES` 里的别名比对。PowerShell 工具要设 `CLAUDE_CODE_USE_POWERSHELL_TOOL=1` 才加载，客户端带了 PowerShell 时代理会自动设。`data/not-builtin.json` 升级成 format 2，旧格式的文件会被忽略。子代理的请求带 `x-claude-code-agent-id`，有自己独立的会话（实测主对话调 Agent，子代理读文件交回结果，全程续接）。
 16. **撤回 / 编辑历史**：每个对话记一串检查点，记下处理到第几条消息、会话里对应哪条记录。客户端撤回或编辑后，只要历史和某个检查点之前的部分完全一致，就从那里用 `resumeSessionAt` 分叉，不整段重建（实测这次请求只写 68 token）。
 17. **SDK 版本跟进**：代理跑的是 SDK 自带的 CLI（`node_modules` 里 `claude-agent-sdk-win32-x64` 下的 `claude.exe`），**不是**服务器上装的 `claude`，所以服务器 `claude` 自动更新不影响代理。真正要跟的是客户端：家里 Claude Desktop 自带的 CLI 和各台电脑的 Claude Code 会自己升级，而客户端的系统提示是原样转发的。`src/services/sdkVersion.ts` 每天查一次 npm 上的最新 SDK，结果在 `GET /api/admin/status` 的 `sdk` 字段；客户端比服务器新时，日志里的 `[version]` 警告会提示升级。升级用 `scripts/update-sdk.ps1 [-Version x]`，它会依次停服务、装新版、编译、启动、用 `e2e-two-prompts.sh` 跑一遍（默认 Haiku），失败就自动装回旧版。**不做全自动升级**：新 CLI 可能改掉会话续接依赖的行为。升级成功后提交 package.json 和 package-lock.json。
+18. **提前起好下一个请求** `src/services/warmSessions.ts`：会话模式的请求要续接会话，用不上 `prewarm()`（它不接受 resume）。但一轮结束时，下一轮怎么开始已经确定了：续接这个会话；如果停在工具调用上，就从那条记录分叉。于是在家里执行工具（或你看回答）的这段时间里，用 SDK 公开的 `startup()` 按这些参数提前把 CLI 起好、把会话读进来。下一个请求的计划和启动参数完全一致时直接接手，不一致就关掉、照常冷启动；接手的进程在还没输出前失败时，按同一个计划冷启动重试，会话不受影响。每个对话最多一个，总共最多 `WARM_SESSION_MAX`（默认 4，每个约 250 MB），闲置 `WARM_SESSION_IDLE_MINUTES`（默认 5）分钟关掉，`WARM_SESSIONS=false` 关闭。实测第一个事件从约 2.7 秒降到约 1.4 秒，工具循环里的请求总耗时大约 2.7～5 秒（原来 3.6～8.9 秒）。
+19. **只让客户端决定什么时候压缩**：服务器 CLI 设了 `DISABLE_AUTO_COMPACT=1`。客户端压缩后发来的新历史会让代理重建会话；服务器自己压缩的话，会背着客户端多一次计费的总结调用，两边的历史也会对不上。上下文窗口实测：Sonnet 5.5、Opus 5.5、Opus 4.8、Haiku 5.5 在服务器上默认就是 100 万；Sonnet 4.6 是 20 万，这个订阅下 4.6 的 `[1m]` 要额外付费额度，所以客户端别给 4.6 选 1M。
 
 ## 同步上游更新
 

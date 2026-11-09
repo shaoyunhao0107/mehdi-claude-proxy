@@ -35,6 +35,7 @@ import { join } from "path";
 import { trackedQuery, type ClaimableSpare, type SdkOptionParams } from "../services/sdkBridge.js";
 import { auditFinish, auditStart, snippet } from "../services/audit.js";
 import { clientIsAhead } from "../services/sdkVersion.js";
+import { dropWarm, takeWarm, warmKey, warmNext, warmSessionsEnabled, type WarmHandle } from "../services/warmSessions.js";
 import { ensureSpare, prewarmEnabled, spareKey, takeSpare } from "../services/sparePool.js";
 import {
   awaitTurn, beginTurn, CONTINUITY_ENABLED, conversationKey, dropTranscript, fingerprintKey, forget, getConversation, memorySessionStore,
@@ -769,7 +770,11 @@ ${t}
   let runSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
 
-  async function run(mode: "session" | "native" | "transcript", allowSpare = true): Promise<void> {
+  // The options of this request's session-mode run, to predict the next one (warmSessions).
+  let lastSessionParams: SdkOptionParams | null = null;
+  let usedWarm = false;
+
+  async function run(mode: "session" | "native" | "transcript", allowSpare = true, allowWarm = true): Promise<void> {
     let content: Block[];
     let systemPrompt: string | undefined;
     // Session mode holds every denial until the whole response has streamed (deny-hold,
@@ -877,6 +882,17 @@ ${t}
       extraOptions,
     };
 
+    // Session mode: a process the previous request started early for exactly this start
+    // (same session, checkpoint and options) skips spawn and transcript loading.
+    let warm: WarmHandle | null = null;
+    if (mode === "session" && session && convKey) {
+      if (allowWarm && session.kind === "continue") warm = await takeWarm(convKey, warmKey(optionParams, toolsSig));
+      else dropWarm(convKey);
+      if (warm) releaseDenies = warm.releaseDenies; // its hooks wait on its own gate
+      lastSessionParams = optionParams;
+    }
+    usedWarm = warm !== null;
+
     // Prewarmed CLI (see sparePool): transcript-mode requests of a tool-using client share
     // all start-up options, so the next one can claim a process started in advance.
     // Native mode resumes a session, which a spare cannot take, but it refills the pool.
@@ -895,12 +911,13 @@ ${t}
       ...optionParams,
       completionId: p.messageId,
       prompt: input(),
-      promptPreview: `[${mode}${spare ? ", warm" : ""}] ${previewOf(body.messages)}`,
+      promptPreview: `[${mode}${spare || warm ? ", warm" : ""}] ${previewOf(body.messages)}`,
       requestedModel: p.requestedModel,
       isStreaming: p.stream,
       apiKeyId: req.apiKeyId ?? null,
       apiKeyName: req.apiKeyName ?? null,
       spare: spare ?? undefined,
+      warm: warm ?? undefined,
     });
 
     // Watchdog: a CLI that goes silent (hung resume, an upstream that never answers, a
@@ -1038,6 +1055,7 @@ ${t}
           cacheRead: u.cache_read_input_tokens, cacheWrite: u.cache_creation_input_tokens,
         },
         warmSpare: usedSpare || undefined,
+        warmSession: usedWarm || undefined,
         fallback: usedFallback || undefined,
         limited: limitedError || undefined,
         textStart: snippet(text, 120),
@@ -1049,7 +1067,19 @@ ${t}
 
   async function runAndRecord(): Promise<void> {
   try {
-    await run(firstMode);
+    try {
+      await run(firstMode);
+    } catch (err) {
+      // An early-started process that failed before any output (expired token copy, a
+      // stale prediction): the same plan, started cold. The session is still intact.
+      if (!finished && usedWarm && !started && acc.blocks.length === 0 && !clientGone) {
+        console.warn("[warm] early-started request failed before output, retrying cold:", (err as Error)?.message);
+        usedWarm = false;
+        await run(firstMode, true, false);
+      } else {
+        throw err;
+      }
+    }
   } catch (err) {
     // After message_stop the SDK typically throws error_max_turns (it tried to go past the
     // intercepted tool call). That is the normal path, not a failure.
@@ -1101,12 +1131,31 @@ ${t}
       });
       if (session.seededId && session.seededId !== runSessionId) dropTranscript(session.seededId);
       if (session.kind === "fresh") removeLocalTranscript(runSessionId);
+      // Start the next request now: resume this session (at the tool-call entry, forking,
+      // when the client is about to send tool results), with the same options.
+      if (warmSessionsEnabled() && lastSessionParams) {
+        const x = (lastSessionParams.extraOptions ?? {}) as Record<string, unknown>;
+        const nextExtra: Record<string, unknown> = {
+          persistSession: true,
+          sessionStore: memorySessionStore,
+          resume: runSessionId,
+          ...(toolIds.length && lastAssistantUuid ? { resumeSessionAt: lastAssistantUuid, forkSession: true } : {}),
+          ...(x.systemPrompt ? { systemPrompt: x.systemPrompt } : {}),
+        };
+        warmNext(
+          convKey,
+          { ...lastSessionParams, mcpServers: planTools(clientTools).mcpServers, extraOptions: nextExtra },
+          toolsSig,
+          (gate) => holdingDenyHooks(gate),
+        );
+      }
       if (DEBUG_CONTINUITY) {
         console.log(`[session] ${session.kind}${session.fork ? "+fork" : ""} ${convKey.slice(0, 8)} -> ${runSessionId.slice(0, 8)} tools=${toolIds.length}`);
       }
     } else {
       if (!limitedError) forget(convKey);
       dropTranscript(session.seededId);
+      dropWarm(convKey);
     }
   }
   }
