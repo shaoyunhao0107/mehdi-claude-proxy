@@ -231,6 +231,10 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
     - `thinking.display`：客户端要 `omitted` 时不再传给 SDK，否则 SDK 会改发 `updates`，和直接用不一样。
     - 仍然不同、而且都来自官方 CLI/SDK 本身的：User-Agent 带 `agent-sdk/<版本>`（官方 SDK 标识）；延迟加载工具的呈现（直接用时 CLI 自己在 system 消息里放 `tool_addition`，代理这边是客户端的延迟工具列表，以提醒文本转发）；几个工具描述里关于 SendMessage、Monitor 的一两句话；beta 头里的 `inline-tools`、`advisor` 这类随配置变化的项。
     - **抓包对比用 `scripts/upstream-recorder.ts`，必须用 Bun 跑**：`~/.bun/bin/bun.exe scripts/upstream-recorder.ts <目录> 3461`，再让**测试实例**的 `ANTHROPIC_BASE_URL` 指向它。官方 CLI 是 Bun v1.4.4 编译的，实测 Bun 1.4.4 的 fetch 和 CLI 的 TLS 握手完全一致（JA3 `1523504b38f0fae0d881d4b6554aac1b`，ALPN http/1.1）。Node 的 https 完全不同（JA3 `944d1e18…`），**不要再用 Node 写的中转碰真实流量**。Bun 装法：从 GitHub Releases 下载 `bun-v1.4.4/bun-windows-x64.zip`，按同目录的 SHASUMS256.txt 校验，解压到 `~/.bun/bin`（官方 install.ps1 在这台机器上会因为 curl 进度输出中断）。CLI 升级时，按 `claude.exe` 里的 `Bun v` 版本换成对应的 Bun。CLI 自带的调试日志（`debug: true` + `CLAUDE_CODE_DEBUG_LOGS_DIR`）只有请求摘要，没有请求体。只做短时间对比，生产实例永远不要指向它。
+21. **延迟加载工具和 ToolSearch**（以前经代理根本加载不了，模型会报"工具没加载上"）：
+    - 工具结果里的 `tool_reference` 块原样转发（只转发这次请求里声明了的工具）。API 就靠它加载延迟工具，和直接用一样。
+    - 客户端除了 tools 数组，还会在 system 消息里声明工具：MCP 工具以 `tool_addition` 块带完整定义，延迟工具只列名字。`withAnnouncedTools` 把这些都交给服务器 CLI：`tool_addition` 的定义注册成 MCP 工具；名单里的内置工具（CronList、Monitor、TaskCreate 等）直接启用 CLI 自己的定义，由服务器 CLI 自己做延迟加载。实测 Bun 抓包和直接用一致：`tool_result[tool_reference:CronList]`，下一个请求 tools 里出现 `CronList`（defer_loading），调用成功。
+    - 仍然不同的一处：客户端的延迟工具列表（里面有只有名字、没有定义的客户端 MCP 工具）只能以提醒文本放在用户消息里转发，服务器 CLI 没法自己生成它。官方 CLI 在不支持 system 消息的模型和老版本上也是这样放的。
 
 ## 同步上游更新
 

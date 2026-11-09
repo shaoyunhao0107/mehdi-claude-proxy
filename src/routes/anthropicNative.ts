@@ -139,6 +139,7 @@ const KNOWN_BUILTINS = new Set([
   "Skill", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
   "Monitor", "TaskStop", "TaskOutput", "ListAgents", "SendMessage", "ScheduleWakeup",
   "CronCreate", "CronDelete", "CronList", "ReportFindings", "PushNotification", "RemoteTrigger", "LSP",
+  "TaskCreate", "TaskGet", "TaskList", "TaskUpdate",
 ]);
 // Persisted across restarts: re-learning it costs the first conversation a cache miss
 // (the tool list, which leads the cached prefix, shrinks between its first two requests).
@@ -246,6 +247,46 @@ function holdingDenyHooks(gate: Promise<void>): Partial<Record<HookEvent, HookCa
       },
     ],
   };
+}
+
+/**
+ * The client's tools plus the ones it announces in its messages: tool_addition
+ * definitions, and built-in tools named in its deferred-tool lists (built-ins need no
+ * schema: the server CLI has its own definitions). Client MCP tools that are only named
+ * (deferred, schema not sent until loaded) arrive in its tools array once loaded.
+ */
+const DEFERRED_LIST_RE = /The following deferred tools are now available via ToolSearch[^\n]*\n([\s\S]*?)(?:\n\n|$)/g;
+function withAnnouncedTools(tools: ClientTool[], messages: Msg[]): ClientTool[] {
+  const out = [...tools];
+  const have = new Set(tools.map((t) => t.name));
+  const add = (t: ClientTool) => {
+    if (!t.name || have.has(t.name)) return;
+    have.add(t.name);
+    out.push(t);
+  };
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) {
+      if (m.role === "system") scanDeferred(m.content, add);
+      continue;
+    }
+    for (const b of m.content) {
+      if (b.type === "tool_addition") {
+        const d = ((b.tool as Block | undefined)?.definition ?? {}) as Partial<ClientTool>;
+        if (typeof d.name === "string") add({ name: d.name, description: d.description, input_schema: d.input_schema ?? { type: "object" } });
+      } else if (m.role === "system" && b.type === "text" && typeof b.text === "string") {
+        scanDeferred(b.text, add);
+      }
+    }
+  }
+  return out;
+}
+function scanDeferred(text: string, add: (t: ClientTool) => void): void {
+  for (const m of text.matchAll(DEFERRED_LIST_RE)) {
+    for (const line of m[1].split("\n")) {
+      const name = line.trim();
+      if (KNOWN_BUILTINS.has(name)) add({ name, input_schema: { type: "object" } });
+    }
+  }
 }
 
 // ---------------- shared helpers ----------------
@@ -417,7 +458,7 @@ interface NMsg {
   content: Block[];
 }
 
-function cleanUserBlock(b: Block): Block | null {
+function cleanUserBlock(b: Block, toUpstream: Map<string, string>, known?: Set<string>): Block | null {
   if (b.type === "text") return b.text ? { type: "text", text: b.text } : null;
   if (isMedia(b)) return cleanMedia(b);
   if (b.type === "tool_result") {
@@ -426,7 +467,17 @@ function cleanUserBlock(b: Block): Block | null {
     if (typeof b.content === "string") out.content = b.content;
     else if (Array.isArray(b.content)) {
       out.content = (b.content as Block[])
-        .map((c) => (c.type === "text" ? { type: "text", text: c.text } : isMedia(c) ? cleanMedia(c) : null))
+        .map((c) => {
+          if (c.type === "text") return { type: "text", text: c.text };
+          if (isMedia(c)) return cleanMedia(c);
+          // ToolSearch results: the reference is what makes the API load the deferred
+          // tool, exactly as in a direct session. Only for tools this request declares.
+          if (c.type === "tool_reference" && typeof c.tool_name === "string") {
+            const name = toUpstream.get(c.tool_name) ?? c.tool_name;
+            return !known || known.has(name) ? { type: "tool_reference", tool_name: name } : null;
+          }
+          return null;
+        })
         .filter(Boolean);
     }
     return out;
@@ -463,6 +514,8 @@ export interface NormalizeOpts {
   dropTotalTokens?: boolean;
   /** The "# Environment" section of system turns (only when the server's one is equal). */
   dropEnvSection?: boolean;
+  /** Upstream tool names this request declares; tool_reference blocks to others are dropped. */
+  knownTools?: Set<string>;
 }
 const ATTRIBUTION_RE = /^<system-reminder>\s*Attribution for git commits and pull requests\b/;
 const TOTAL_TOKENS_RE = /^\s*<total_tokens>[^<]*tokens left<\/total_tokens>\s*$/;
@@ -491,7 +544,7 @@ function normalize(messages: Msg[], toUpstream: Map<string, string>, opts: Norma
     if (m.role !== "user" && m.role !== "assistant") return null;
     const raw: Block[] = typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content;
     let blocks = raw
-      .map((b) => (m.role === "user" ? cleanUserBlock(b) : cleanAssistantBlock(b, toUpstream)))
+      .map((b) => (m.role === "user" ? cleanUserBlock(b, toUpstream, opts.knownTools) : cleanAssistantBlock(b, toUpstream)))
       .filter((b): b is Block => b !== null)
       .filter((b) => !(opts.dropAttribution && b.type === "text" && ATTRIBUTION_RE.test(String(b.text))));
     if (m.role === "user" && pendingSystem.length) {
@@ -736,7 +789,11 @@ function errorPayload(err: unknown): Block {
 export async function handleNative(req: Request, res: Response, p: NativeParams): Promise<void> {
   const { body } = p;
   checkClientVersion(req);
-  const clientTools = body.tool_choice?.type === "none" ? [] : p.clientTools;
+  // Besides its tools array, a Claude Code client announces tools in system turns: MCP
+  // tools as tool_addition blocks (full definitions) and deferred tools by name. Giving
+  // the server CLI the same tools lets it run tool search and deferred loading itself,
+  // as in a direct session (otherwise ToolSearch can never load anything).
+  const clientTools = body.tool_choice?.type === "none" ? [] : withAnnouncedTools(p.clientTools, body.messages);
   const t0 = Date.now();
   const audit = auditStart(req, p.messageId, body as unknown as Record<string, unknown>);
   if (audit) {
@@ -776,8 +833,9 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
         dropAttribution: true,
         dropTotalTokens: true,
         dropEnvSection: runCwd !== p.sdkCwd && !!clientEnv && serverEnvMatches(clientEnv),
+        knownTools: new Set([...plan.builtins, ...plan.toClient.keys()]),
       }
-    : {};
+    : { knownTools: new Set([...plan.builtins, ...plan.toClient.keys()]) };
   // The client's own system prompt without the parts the server CLI writes itself (its
   // billing header and identity line), so upstream gets the CLI's usual three blocks.
   const clientSystemBody = clientIsOfficial ? officialPromptBody(body.system) : clientSystem;
