@@ -1,16 +1,29 @@
 # One-shot install for Windows: deps, build, secrets, boot-time scheduled task, firewall, first API key.
 # Run from an elevated PowerShell (needed for the scheduled task and firewall rule):
-#   powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1 [-Port 3457] [-KeyName home-pc]
+#   powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1 [-Role anthropic|openai] [-Port N] [-KeyName home-pc]
 # Safe to re-run: existing secrets / keys are kept, the task and firewall rule are replaced.
+#
+# Two roles, chosen with -Role (install one or both — both share this folder's DB and key):
+#   anthropic (default): Anthropic /v1/messages with client-side tools. Default port 3457,
+#                        task "mehdi-claude-proxy". This is the original proxy.
+#   openai:              also serves the OpenAI layer (/v1/chat/completions, /v1/responses)
+#                        for Cursor / Cline / Cherry / Codex etc. Default port 3458, task
+#                        "mehdi-claude-proxy-openai". Separate process, so it never disturbs
+#                        the Anthropic one. Run this script twice (once per role) for both.
 param(
-    [int]$Port = 3457,
-    [string]$TaskName = "mehdi-claude-proxy",
+    [ValidateSet("anthropic", "openai")][string]$Role = "anthropic",
+    [int]$Port = 0,
+    [string]$TaskName = "",
     [string]$KeyName = "home-pc",
     [switch]$NoFirewall
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
+
+# Role-specific defaults (only when the caller did not override them).
+if ($Port -eq 0) { $Port = if ($Role -eq "openai") { 3458 } else { 3457 } }
+if ($TaskName -eq "") { $TaskName = if ($Role -eq "openai") { "mehdi-claude-proxy-openai" } else { "mehdi-claude-proxy" } }
 
 function Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
 function Check-Exit($what) { if ($LASTEXITCODE -ne 0) { throw "$what failed (exit $LASTEXITCODE)" } }
@@ -54,11 +67,12 @@ if (-not (Test-Path "$root\.admin-secret")) {
 
 Step "Scheduled task '$TaskName' (runs at boot as $env:USERNAME, no login needed)"
 $script = "$root\scripts\start-public.ps1"
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script`" -Port $Port" -WorkingDirectory $root
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script`" -Port $Port -Role $Role" -WorkingDirectory $root
 $trigger = New-ScheduledTaskTrigger -AtStartup; $trigger.Delay = "PT40S"
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "claude-code-proxy on :$Port (Anthropic /v1/messages, client-side tools)" -Force | Out-Null
+$desc = if ($Role -eq "openai") { "claude-code-proxy on :$Port (OpenAI layer: /v1/chat/completions, /v1/responses + Anthropic /v1/messages, client-side tools)" } else { "claude-code-proxy on :$Port (Anthropic /v1/messages, client-side tools)" }
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description $desc -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 
 if (-not $NoFirewall) {
@@ -72,7 +86,7 @@ $ok = $false
 foreach ($i in 1..30) {
     try { Invoke-RestMethod "http://127.0.0.1:$Port/health" -TimeoutSec 10 | Out-Null; $ok = $true; break } catch { Start-Sleep 2 }
 }
-if (-not $ok) { throw "Server did not come up on :$Port. Check $root\proxy.log" }
+if (-not $ok) { $logName = if ($Role -eq "openai") { "proxy-openai.log" } else { "proxy.log" }; throw "Server did not come up on :$Port. Check $root\$logName" }
 
 Step "API key for clients"
 if (-not (Test-Path "$root\.home-key")) {
@@ -82,5 +96,10 @@ if (-not (Test-Path "$root\.home-key")) {
     Write-Host "  created key '$KeyName' ($($r.key_prefix)...) -> .home-key"
 } else { Write-Host "  keeping existing .home-key" }
 
-Write-Host "`nDone. Proxy: http://0.0.0.0:$Port   key: $root\.home-key" -ForegroundColor Green
+Write-Host "`nDone ($Role role). Proxy: http://0.0.0.0:$Port   key: $root\.home-key" -ForegroundColor Green
+if ($Role -eq "openai") {
+    Write-Host "  OpenAI endpoints: POST /v1/chat/completions, POST /v1/responses (Codex). Anthropic /v1/messages also served."
+} else {
+    Write-Host "  Anthropic endpoint: POST /v1/messages. (For OpenAI clients, install the 'openai' role: -Role openai.)"
+}
 Write-Host "Remember to open TCP $Port in the cloud security group, then configure clients (see SKILL.md)."

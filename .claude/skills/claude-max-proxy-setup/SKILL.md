@@ -68,6 +68,19 @@ description: 在一台已登录 Claude Max 的机器上安装、配置、验证�
 
 没装 Claude Code：`npm install -g @anthropic-ai/claude-code`，然后运行 `claude` 登录。登录必须让用户本人在浏览器完成，不要索要或代填账号、令牌。
 
+## 装哪个协议（两个角色，可只装一个，也可都装）
+
+一套代码、一个仓库，装的时候用 `-Role` 选协议。两个角色是**各自独立的进程和端口**，但**共用这个目录的数据库和 `.home-key`**（一把 key 两个端口都能用），互不影响。
+
+| 角色 | 协议 / 端点 | 默认端口 | 计划任务名 | 给谁用 |
+|---|---|---|---|---|
+| `anthropic`（默认） | Anthropic `/v1/messages`，工具在客户端 | 3457 | `mehdi-claude-proxy` | 家里的 Claude Code / Claude Desktop、WorkBuddy（经 Magpie） |
+| `openai` | OpenAI `/v1/chat/completions` + `/v1/responses`（Codex），同机也serves `/v1/messages` | 3458 | `mehdi-claude-proxy-openai` | Cursor、Cline、Roo、Continue、OpenWebUI、Cherry、Codex CLI |
+
+- **只要现在这套（Anthropic）**：只装 `anthropic`，就是原样，一字节不改。随时回退：`git checkout prod-openai-baseline-20261109`（标注好的已知可用版本）再装。
+- **OpenAI 备用**：`openai` 角色复用同一套加固内核（官方 SDK、复用本机登录、工具交回客户端、第三方会话续接、上游只发官方 Claude Code 预设）。上游指纹和 `/v1/messages` 一致；OpenAI 特有代码全在 `src/routes/openai/`，`ENABLE_OPENAI_LAYER` 关着时根本不挂载。
+- 两个都要：把下面的安装命令按角色各跑一次。
+
 ## 安装：Windows（脚本一键）
 
 在**管理员** PowerShell 中：
@@ -75,14 +88,17 @@ description: 在一台已登录 Claude Max 的机器上安装、配置、验证�
 ```powershell
 gh repo clone shaoyunhao0107/mehdi-claude-proxy
 cd mehdi-claude-proxy
-powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1 -Port 3457 -KeyName home-pc
+# Anthropic（3457，默认）
+powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1 -Role anthropic -KeyName home-pc
+# OpenAI 备用（3458）——需要就再跑这一条
+powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1 -Role openai
 ```
 
-脚本会：装依赖并放行 `better-sqlite3` 的本地编译（npm 11+ 默认拦截安装脚本）→ 编译 → 生成 `.admin-secret` →
+`-Role` 决定默认端口和任务名（上表）；也可以用 `-Port` 覆盖。脚本会：装依赖并放行 `better-sqlite3` 的本地编译（npm 11+ 默认拦截安装脚本）→ 编译 → 生成 `.admin-secret` →
 注册开机计划任务（以当前用户 S4U 身份、无需登录桌面、无运行时长上限、崩溃自动重启）→ 放行 Windows 防火墙端口 →
-等服务起来 → 创建客户端 key 写入 `.home-key`。可以重复运行，已有的 secret 和 key 会保留。
+等服务起来 → 创建客户端 key 写入 `.home-key`。可以重复运行，已有的 secret 和 key 会保留。openai 角色会用独立的 `data/sessions-openai`、`data/audit-openai`、`proxy-openai.log`，不和 anthropic 角色抢文件。
 
-装完还要**用户自己**在云服务器安全组/路由器放行该 TCP 端口，最好只放行客户端 IP。
+装完还要**用户自己**在云服务器安全组/路由器放行该 TCP 端口（openai 角色默认是 3458），最好只放行客户端 IP。
 
 ## 安装：Linux / macOS（手动）
 
@@ -257,6 +273,13 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
     - 脚本修复：从 PowerShell 调 bash 时，`python` 会解析成 Microsoft Store 的占位程序，加上 stderr 在 `$ErrorActionPreference=Stop` 下会中断脚本，回归测试和回滚都被跳过。现在会把真实的 Python 加进 PATH，调用 bash 时临时改成 Continue。
 26. **内存保护**（`src/services/memoryGuard.ts`）：空闲内存减去一个 CLI（约 250 MB）后低于 `MIN_FREE_MEMORY_MB`（默认 1024）时，不再预启动下一个请求（warmSessions）和备用进程（sparePool），并先关掉最老的预热进程和所有备用进程。正常请求不受影响，只是改为冷启动。状态在 `/api/admin/status` 的 `memory` 字段，包括被跳过的次数。服务器总内存 7.9 GB，平时空闲 1.5–2 GB。
 27. **单元测试**（`npm test`，不调用 API，不花额度，约 2 秒）：用 `node --test` 加 tsx，`tests/setup.ts` 先把数据库、sessions、审计日志、`CLAUDE_CONFIG_DIR` 都指向临时目录。覆盖的内容：会话 ID 怎么选（客户端自己的 ID、本机已被占用的 ID、子代理用父会话的 ID、主请求还没保存时来的子代理）、续接不分叉、子代理新建会话或被 forget 时**不能删掉父对话的记录**（做过变异测试：把 `dropTranscript(storeId)` 改成 `dropTranscript(id)`，测试会失败）、storeFor 映射、scrubDenials、新建会话的锁、错误分类（402/429/401）、内存保护。`update-sdk.ps1` 每次切换版本都会先跑一遍。改动会话相关代码后先跑 `npm test`，再跑 e2e。内部函数通过 `anthropicNative.ts` 末尾的 `__test` 导出。
+
+28. **OpenAI 协议层（备用角色，端口 3458）**（2026-11-09，分支 `openai-layer`；对应"OpenAI 协议反代"调研的方案 B）：在 `src/routes/openai/` 里新增一层协议转换，把 OpenAI 请求翻成 Anthropic 后走**现有 `handleNative` 主流程**（一行没改），再把回复翻回 OpenAI。所以 OpenAI 端点白捡了全部加固：上游只发官方 `claude_code` 预设（审计 `upstream.systemPrompt` 确认）、官方工具定义、工具交回客户端、第三方会话续接（按 API key + 第一条消息）。
+    - 文件：`index.ts`（`ENABLE_OPENAI_LAYER=1` 才挂载；没设就等于不存在，anthropic 角色完全不受影响）、`translateRequest.ts` / `translateResponses.ts`（请求翻译；system 收集、tool_choice、多模态、function_call/tool_result、Codex 的 input 数组 / apply_patch custom 工具 / developer 消息保持在历史里不进 system 以免毁缓存）、`responsesTools.ts`（function/custom/namespace 工具别名，让响应能还原成 function_call 还是 custom_tool_call）、`resAdapter.ts` 和 `responsesAdapter.ts`（**假 res**：拦截 `handleNative` 写出的 Anthropic SSE/JSON，翻成 OpenAI `chat.completion(.chunk)` 或 Responses 事件，含真流式、tool_calls、sequence_number、usage）、`chatCompletions.ts` / `responses.ts`（路由）。
+    - 端点：`POST /v1/chat/completions`（Cursor/Cline/Cherry/OpenWebUI…）、`POST /v1/responses`（Codex CLI）。实测过：两个端点的非流式、流式、工具调用、多轮工具循环；Responses 的事件顺序（created→output_item→function_call_arguments→completed，sequence 单调）、apply_patch→custom_tool_call。Codex CLI 的端到端还需要家里用真 Codex 验证。
+    - 单元测试在 `tests/openai.test.ts`（12 个，不花额度）：请求翻译、两个适配器的流式和非流式、错误映射。总共 26 个。
+    - 安装：`install-windows.ps1 -Role openai`（见上文"装哪个协议"）。两个角色共用 DB 和 key，openai 角色用独立 session/audit/log。
+    - 旧的 `src/routes/proxy.ts` 里那个 `/v1/chat/completions`（工具在服务器执行、注入 "You are NOT Claude Code"、伪流式）仍在，但新层挂载时会优先命中；以后可以删。
 
 ## 同步上游更新
 
