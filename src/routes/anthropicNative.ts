@@ -30,7 +30,8 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "fs";
-import { homedir, tmpdir } from "os";
+import { homedir, release as osRelease, tmpdir, version as osVersion } from "os";
+import { execFileSync } from "child_process";
 import { join } from "path";
 import { trackedQuery, type ClaimableSpare, type SdkOptionParams } from "../services/sdkBridge.js";
 import { auditFinish, auditStart, snippet } from "../services/audit.js";
@@ -306,6 +307,7 @@ function clientEnvironment(messages: Msg[], clientSystem?: string): string | nul
  * the client works in. The directory is created empty if missing; no tool ever runs here.
  */
 const MIRROR_CLIENT_CWD = process.env.MIRROR_CLIENT_CWD !== "false";
+const DEDUPE_CLI_ATTACHMENTS = process.env.DEDUPE_CLI_ATTACHMENTS !== "false";
 function mirroredCwd(env: string | null): string | null {
   if (!MIRROR_CLIENT_CWD || !env) return null;
   const m = /Primary working directory:\s*(.+)/.exec(env);
@@ -314,11 +316,56 @@ function mirroredCwd(env: string | null): string | null {
   const usable = process.platform === "win32" ? /^[A-Za-z]:[\\/]/.test(dir) : dir.startsWith("/");
   if (!usable || dir.includes("\0")) return null;
   try {
+    if (process.platform === "win32") ensureDrive(dir[0].toUpperCase());
     mkdirSync(dir, { recursive: true });
+    // Same answer to "Is a git repository" as the client's environment gives.
+    if (/Is a git repository:\s*true/i.test(env) && !existsSync(join(dir, ".git"))) {
+      execFileSync("git", ["init", "-q", dir], { stdio: "ignore", timeout: 15_000 });
+    }
     return dir;
   } catch {
     return null;
   }
+}
+
+/**
+ * A client drive letter this server lacks (the home PC works on I:) is mapped with subst
+ * to a folder under data/drives, so the CLI runs in the very path the client reports and
+ * its environment says the same as the client's. Only for letters that do not exist.
+ */
+const substituted = new Set<string>();
+function ensureDrive(letter: string): void {
+  if (!MIRROR_SUBST_DRIVES || substituted.has(letter) || existsSync(`${letter}:\\`)) return;
+  const target = join(process.cwd(), "data", "drives", letter);
+  mkdirSync(target, { recursive: true });
+  execFileSync("subst", [`${letter}:`, target], { stdio: "ignore", timeout: 15_000 });
+  substituted.add(letter);
+  console.log(`[native] mapped missing drive ${letter}: to ${target} for client working directories`);
+}
+const MIRROR_SUBST_DRIVES = process.env.MIRROR_SUBST_DRIVES !== "false";
+
+/** Would the server CLI describe this machine the way the client's environment does? */
+function serverEnvMatches(env: string): boolean {
+  const line = (k: string) => new RegExp(`${k}:\\s*([^\\n]+)`).exec(env)?.[1].trim();
+  if (line("Platform") && line("Platform") !== process.platform) return false;
+  const osv = line("OS Version");
+  if (osv && osv !== `${osVersion()} ${osRelease()}`) return false;
+  return true;
+}
+
+/**
+ * The Claude Code client's system prompt without its billing header and identity line,
+ * which the server CLI writes itself (blocks 0 and 1). Upstream then gets the CLI's usual
+ * layout: [billing header, identity (cached), body (cached)] instead of one merged block.
+ */
+const IDENTITY_LINE_RE = /^\s*You are (Claude Code, Anthropic's official CLI for Claude|a Claude agent, built on Anthropic's Claude Agent SDK)[^\n]*$/;
+function officialPromptBody(system: NativeBody["system"]): string | undefined {
+  if (!system) return undefined;
+  const parts = typeof system === "string" ? [system] : system.filter((b) => b.type === "text").map((b) => String(b.text ?? ""));
+  const kept = parts
+    .map((t) => t.split("\n").filter((l, i) => !(i === 0 && l.startsWith("x-anthropic-billing-header:"))).join("\n"))
+    .filter((t) => t.trim() && !IDENTITY_LINE_RE.test(t.trim()) && !t.trim().startsWith("x-anthropic-billing-header:"));
+  return kept.join("\n\n") || undefined;
 }
 
 function previewOf(messages: Msg[]): string {
@@ -345,12 +392,17 @@ const BUDGET_ONLY = /haiku-4-5|-4-5-|sonnet-4-0|opus-4-0|opus-4-1|3-7/;
 // still forces adaptive on 5.x models, where the model decides whether to think).
 function mapThinking(t: unknown, model: string, maxTokens?: number): SdkThinking {
   if (!t || typeof t !== "object") return { type: "disabled" };
-  const o = t as { type?: string; budget_tokens?: number };
+  const o = t as { type?: string; budget_tokens?: number; display?: string };
   if (o.type !== "adaptive" && o.type !== "enabled") return { type: "disabled" };
-  if (!BUDGET_ONLY.test(model)) return { type: "adaptive", display: "summarized" };
+  // As the client asked. "omitted" is what a CLI sends by default, so then no display is
+  // set and the server CLI sends its own default (passing "omitted" through the SDK makes
+  // it send "updates" instead); otherwise "summarized", which shows thinking in the UI.
+  const display = o.display === "omitted" ? undefined : "summarized";
+  if (!BUDGET_ONLY.test(model)) return display ? { type: "adaptive", display } : { type: "adaptive" };
   let budget = typeof o.budget_tokens === "number" ? o.budget_tokens : 8000;
   if (maxTokens && budget >= maxTokens) budget = maxTokens - 1;
-  return budget >= 1024 ? { type: "enabled", budgetTokens: budget, display: "summarized" } : { type: "disabled" };
+  if (budget < 1024) return { type: "disabled" };
+  return display ? { type: "enabled", budgetTokens: budget, display } : { type: "enabled", budgetTokens: budget };
 }
 
 function mapEffort(oc: unknown): string | undefined {
@@ -397,13 +449,42 @@ function cleanAssistantBlock(b: Block, toUpstream: Map<string, string>): Block |
   }
 }
 
+/**
+ * What the server's own CLI generates for every request anyway. A Claude Code client
+ * sends its own copies (it is the same CLI); forwarding them too would put each one in
+ * the upstream request twice, which a direct CLI session never does. Only these exact,
+ * CLI-generated shapes are dropped; anything client-specific (CLAUDE.md, its MCP server
+ * instructions, its tool lists) is kept.
+ */
+export interface NormalizeOpts {
+  /** "Attribution for git commits and pull requests ..." reminder. */
+  dropAttribution?: boolean;
+  /** <total_tokens>N tokens left</total_tokens> system turns. */
+  dropTotalTokens?: boolean;
+  /** The "# Environment" section of system turns (only when the server's one is equal). */
+  dropEnvSection?: boolean;
+}
+const ATTRIBUTION_RE = /^<system-reminder>\s*Attribution for git commits and pull requests\b/;
+const TOTAL_TOKENS_RE = /^\s*<total_tokens>[^<]*tokens left<\/total_tokens>\s*$/;
+
+/** The text without its "# Environment" section (up to the next other heading). */
+function withoutEnvSection(t: string): string {
+  const k = t.indexOf("# Environment");
+  if (k < 0) return t;
+  const rest = t.slice(k);
+  const next = rest.search(/\n#{1,2} (?!Environment)/);
+  return (t.slice(0, k) + (next > 0 ? rest.slice(next + 1) : "")).trim();
+}
+
 /** Client messages -> strictly alternating user/assistant messages; system turns become reminders. */
-function normalize(messages: Msg[], toUpstream: Map<string, string>): NMsg[] | null {
+function normalize(messages: Msg[], toUpstream: Map<string, string>, opts: NormalizeOpts = {}): NMsg[] | null {
   const out: NMsg[] = [];
   let pendingSystem: Block[] = [];
   for (const m of messages) {
     if (m.role === "system") {
-      const t = textOf(m.content);
+      let t = textOf(m.content);
+      if (opts.dropTotalTokens && TOTAL_TOKENS_RE.test(t)) continue;
+      if (opts.dropEnvSection) t = withoutEnvSection(t);
       if (t) pendingSystem.push({ type: "text", text: `<system-reminder>\n${t}\n</system-reminder>` });
       continue;
     }
@@ -411,7 +492,8 @@ function normalize(messages: Msg[], toUpstream: Map<string, string>): NMsg[] | n
     const raw: Block[] = typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content;
     let blocks = raw
       .map((b) => (m.role === "user" ? cleanUserBlock(b) : cleanAssistantBlock(b, toUpstream)))
-      .filter((b): b is Block => b !== null);
+      .filter((b): b is Block => b !== null)
+      .filter((b) => !(opts.dropAttribution && b.type === "text" && ATTRIBUTION_RE.test(String(b.text))));
     if (m.role === "user" && pendingSystem.length) {
       // tool_result blocks must stay first in a user message
       const results = blocks.filter((b) => b.type === "tool_result");
@@ -687,6 +769,18 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   const clientIsOfficial = !!clientSystem && LOOKS_OFFICIAL.test(clientSystem.slice(0, 400));
   const clientEnv = clientIsOfficial ? clientEnvironment(body.messages, clientSystem) : null;
   const runCwd = mirroredCwd(clientEnv) ?? p.sdkCwd;
+  // A Claude Code client: drop its copies of what the server CLI adds itself (see
+  // NormalizeOpts). The environment only when the server's would say the same thing.
+  const nopts: NormalizeOpts = clientIsOfficial && DEDUPE_CLI_ATTACHMENTS
+    ? {
+        dropAttribution: true,
+        dropTotalTokens: true,
+        dropEnvSection: runCwd !== p.sdkCwd && !!clientEnv && serverEnvMatches(clientEnv),
+      }
+    : {};
+  // The client's own system prompt without the parts the server CLI writes itself (its
+  // billing header and identity line), so upstream gets the CLI's usual three blocks.
+  const clientSystemBody = clientIsOfficial ? officialPromptBody(body.system) : clientSystem;
   const extraEnv: Record<string, string> = {};
   if (typeof body.max_tokens === "number" && body.max_tokens > 0) {
     extraEnv.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(body.max_tokens);
@@ -707,7 +801,7 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
     (m) => Array.isArray(m.content) && m.content.some((b) => b.type === "tool_use" || b.type === "tool_result"),
   );
   if (NATIVE_HISTORY && last?.role === "user" && !lastHasToolResult && (!hasToolHistory || NATIVE_AFTER_TOOLS)) {
-    native = normalize(body.messages, plan.toUpstream);
+    native = normalize(body.messages, plan.toUpstream, nopts);
   }
 
   // Session continuity (see conversationStore): a Claude Code client's main loop (tools,
@@ -735,7 +829,7 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
 ${t}
 </system-reminder>` }));
   const session = convKey
-    ? planSession(convKey, body.messages, msgHashes, plan.toUpstream, runCwd, p.resolvedModel, leadReminders)
+    ? planSession(convKey, body.messages, msgHashes, plan.toUpstream, runCwd, p.resolvedModel, leadReminders, nopts)
     : null;
   if (DEBUG_CONTINUITY && convCandidate) console.log(`[session] ${p.messageId.slice(-6)} key=${convCandidate.slice(0, 8)} waited-ok=${!!convKey} plan=${session?.kind ?? "none"} resume=${session?.sessionId?.slice(0, 8)} at=${session?.resumeAt?.slice(0, 8)} msgs=${body.messages.length}`);
 
@@ -842,7 +936,7 @@ ${t}
     } else {
       const single = body.messages.length === 1 && body.messages[0].role === "user";
       content = single
-        ? (normalize(body.messages, plan.toUpstream)?.[0]?.content ?? buildTranscriptBlocks(body.messages))
+        ? (normalize(body.messages, plan.toUpstream, nopts)?.[0]?.content ?? buildTranscriptBlocks(body.messages))
         : buildTranscriptBlocks(body.messages);
       systemPrompt = (single ? sysParts : [TRANSCRIPT_NOTE, ...sysParts]).join("\n\n") || undefined;
       if (SYSTEM_PROMPT_MODE === "official") content = [...reminderBlocks(single ? [] : [TRANSCRIPT_NOTE]), ...content];
@@ -857,7 +951,7 @@ ${t}
     }
     if (SYSTEM_PROMPT_MODE === "official") {
       if (clientIsOfficial) {
-        systemPrompt = clientSystem;
+        systemPrompt = clientSystemBody;
       } else {
         systemPrompt = undefined;
         extraOptions.systemPrompt = OFFICIAL_PRESET;
@@ -1193,13 +1287,14 @@ function planSession(
   cwd: string,
   model: string,
   lead: Block[],
+  nopts: NormalizeOpts,
 ): SessionPlan | null {
   const st = getConversation(key);
   if (st) {
     const n = st.msgHashes.length;
     const prefixOk = messages.length > n + 1 && st.msgHashes.every((h, i) => h === hashes[i]);
     if (prefixOk && messages[n].role === "assistant") {
-      const delta = normalize(messages.slice(n + 1), toUpstream);
+      const delta = normalize(messages.slice(n + 1), toUpstream, nopts);
       if (delta && delta.length === 1) {
         const results = delta[0].content.filter((b) => b.type === "tool_result").map((b) => b.tool_use_id as string);
         const pending = st.pendingToolIds ?? [];
@@ -1226,7 +1321,7 @@ function planSession(
       let same = true;
       for (let i = 0; i < c.n; i++) if (st.msgHashes[i] !== hashes[i]) { same = false; break; }
       if (!same) continue;
-      const delta = normalize(messages.slice(c.n + 1), toUpstream);
+      const delta = normalize(messages.slice(c.n + 1), toUpstream, nopts);
       if (!delta || delta.length !== 1) continue;
       const results = delta[0].content.filter((b) => b.type === "tool_result").map((b) => b.tool_use_id as string);
       const pending = c.pending ?? [];
@@ -1239,7 +1334,7 @@ function planSession(
     }
     if (DEBUG_CONTINUITY) console.log(`[session] ${key.slice(0, 8)}: history does not extend the kept session, rebuilding`);
   }
-  const all = normalize(messages, toUpstream);
+  const all = normalize(messages, toUpstream, nopts);
   if (!all) return null;
   const history = all.slice(0, -1);
   const content = all[all.length - 1].content;
