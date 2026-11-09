@@ -40,6 +40,7 @@ import { dropWarm, takeWarm, warmKey, warmNext, warmSessionsEnabled, type WarmHa
 import { ensureSpare, prewarmEnabled, spareKey, takeSpare } from "../services/sparePool.js";
 import {
   awaitTurn, beginTurn, CONTINUITY_ENABLED, conversationKey, dropTranscript, fingerprintKey, forget, getConversation, memorySessionStore,
+  scrubDenials, stableSessionId,
   messageHash, removeLocalTranscript, saveConversation, seedTranscript,
 } from "../services/conversationStore.js";
 import { cancelTask } from "../services/taskTracker.js";
@@ -205,6 +206,8 @@ function planTools(clientTools: ClientTool[]): ToolPlan {
   return { builtins, mcpServers, toClient, toUpstream };
 }
 
+// The reason text of every denial (also how scrubDenials recognises them afterwards).
+const DENY_REASON = "Executed by the client.";
 // Every tool call is denied before execution: the client runs it, never this server.
 const DENY_ALL_TOOLS: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
   PreToolUse: [
@@ -214,7 +217,7 @@ const DENY_ALL_TOOLS: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
           hookSpecificOutput: {
             hookEventName: "PreToolUse" as const,
             permissionDecision: "deny" as const,
-            permissionDecisionReason: "Executed by the client.",
+            permissionDecisionReason: DENY_REASON,
           },
         }),
       ],
@@ -238,7 +241,7 @@ function holdingDenyHooks(gate: Promise<void>): Partial<Record<HookEvent, HookCa
               hookSpecificOutput: {
                 hookEventName: "PreToolUse" as const,
                 permissionDecision: "deny" as const,
-                permissionDecisionReason: "Executed by the client.",
+                permissionDecisionReason: DENY_REASON,
               },
             };
           },
@@ -1279,8 +1282,12 @@ ${t}
         msgHashes,
         checkpointUuid: toolIds.length ? lastAssistantUuid : undefined,
         pendingToolIds: toolIds.length ? toolIds : undefined,
+        tipUuid: lastAssistantUuid,
         checkpoints,
       });
+      // The turn stopped at client tool calls: drop the synthetic denials, so the same
+      // session continues with the real results (before any early start loads it).
+      if (toolIds.length) scrubDenials(runSessionId, DENY_REASON);
       if (session.seededId && session.seededId !== runSessionId) dropTranscript(session.seededId);
       if (session.kind === "fresh") removeLocalTranscript(runSessionId);
       // Start the next request now: resume this session (at the tool-call entry, forking,
@@ -1291,7 +1298,7 @@ ${t}
           persistSession: true,
           sessionStore: memorySessionStore,
           resume: runSessionId,
-          ...(toolIds.length && lastAssistantUuid ? { resumeSessionAt: lastAssistantUuid, forkSession: true } : {}),
+          ...(lastAssistantUuid ? { resumeSessionAt: lastAssistantUuid } : {}),
           ...(x.systemPrompt ? { systemPrompt: x.systemPrompt } : {}),
         };
         warmNext(
@@ -1360,12 +1367,14 @@ function planSession(
           ? pending.length === results.length && pending.every((id) => results.includes(id)) && !!st.checkpointUuid
           : results.length === 0;
         if (answersExactly) {
+          // Always resume at the last reply, in the same session (no fork): the turn's
+          // denials were scrubbed, so the real results simply follow the tool calls.
           return {
             kind: "continue",
             basisN: n,
             sessionId: st.sdkSessionId,
-            resumeAt: pending.length ? st.checkpointUuid : undefined,
-            fork: pending.length > 0,
+            resumeAt: pending.length ? st.checkpointUuid : st.tipUuid,
+            fork: false,
             content: delta[0].content,
           };
         }
@@ -1388,7 +1397,8 @@ function planSession(
         : results.length === 0;
       if (!ok) continue;
       if (DEBUG_CONTINUITY) console.log(`[session] ${key.slice(0, 8)}: rewind to turn after ${c.n} message(s)`);
-      return { kind: "rewind", basisN: c.n, sessionId: st.sdkSessionId, resumeAt: c.uuid, fork: true, content: delta[0].content };
+      // Like a direct CLI rewind: a new branch in the same session from that turn's reply.
+      return { kind: "rewind", basisN: c.n, sessionId: st.sdkSessionId, resumeAt: c.uuid, fork: false, content: delta[0].content };
     }
     if (DEBUG_CONTINUITY) console.log(`[session] ${key.slice(0, 8)}: history does not extend the kept session, rebuilding`);
   }
@@ -1396,17 +1406,21 @@ function planSession(
   if (!all) return null;
   const history = all.slice(0, -1);
   const content = all[all.length - 1].content;
-  if (history.length === 0) return { kind: "fresh", sessionId: randomUUID(), fork: false, content: [...lead, ...content] };
+  // One session id per conversation upstream: Claude Code's own session id when the key
+  // is it (what the client would have sent itself), else the one already in use, else new.
+  const id = stableSessionId(key) ?? st?.sdkSessionId ?? randomUUID();
+  if (history.length === 0) {
+    dropTranscript(id); // a fresh start of this conversation: nothing earlier applies
+    return { kind: "fresh", sessionId: id, fork: false, content: [...lead, ...content] };
+  }
   if (lead.length) history[0] = { ...history[0], content: [...lead, ...history[0].content] };
-  const seed = randomUUID();
-  const entries = buildEntries(history, seed, cwd, model);
-  seedTranscript(seed, entries as Array<{ type: string; [k: string]: unknown }>);
+  const entries = buildEntries(history, id, cwd, model);
+  seedTranscript(id, entries as Array<{ type: string; [k: string]: unknown }>);
   return {
     kind: "rebuild",
-    sessionId: seed,
+    sessionId: id,
     resumeAt: entries[entries.length - 1].uuid as string,
-    fork: true,
+    fork: false,
     content,
-    seededId: seed,
   };
 }

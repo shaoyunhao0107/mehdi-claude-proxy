@@ -42,6 +42,8 @@ export interface ConversationState {
   /** Set when the turn stopped at client tool calls: resume point and the awaited ids. */
   checkpointUuid?: string;
   pendingToolIds?: string[];
+  /** The last assistant entry of the session: where the next request resumes. */
+  tipUuid?: string;
   /**
    * One per earlier turn: after the first `n` client messages, the reply ended at transcript
    * entry `uuid` (awaiting `pending` tool results, if any). A client that rewinds to one of
@@ -171,6 +173,70 @@ export function seedTranscript(sessionId: string, entries: SessionStoreEntry[]):
   transcripts.set(sessionId, entries);
   if (SID_RE.test(sessionId)) {
     diskWrite(() => writeFileSync(fileOf(sessionId), entries.map((e) => JSON.stringify(e)).join("\n") + "\n"));
+  }
+}
+
+/**
+ * Remove the synthetic denials of a turn that stopped at client tool calls (the
+ * PreToolUse hook's "denied" tool_result entries) and the entries the CLI hung after
+ * them. The session then simply ends at the tool calls, and the next request appends
+ * the client's real results to the SAME session (one session id for the whole
+ * conversation, as in a direct CLI session, instead of a fork per tool turn).
+ * Without this, a resumed session would carry the denials alongside the real results.
+ */
+export function scrubDenials(sessionId: string, marker: string): number {
+  const list = transcripts.get(sessionId) ?? readTranscript(sessionId);
+  if (!list) return 0;
+  const removed = new Set<string>();
+  for (const e of list) {
+    const content = (e.message as { content?: unknown } | undefined)?.content;
+    if (e.type !== "user" || !e.uuid || !Array.isArray(content) || content.length === 0) continue;
+    const allDenials = content.every(
+      (b: { type?: string; content?: unknown }) => b?.type === "tool_result" && JSON.stringify(b.content ?? "").includes(marker),
+    );
+    if (allDenials) removed.add(e.uuid);
+  }
+  if (removed.size === 0) return 0;
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const e of list) {
+      if (e.uuid && !removed.has(e.uuid) && typeof e.parentUuid === "string" && removed.has(e.parentUuid)) {
+        removed.add(e.uuid);
+        grew = true;
+      }
+    }
+  }
+  const kept = list.filter((e) => !e.uuid || !removed.has(e.uuid));
+  transcripts.set(sessionId, kept);
+  if (SID_RE.test(sessionId)) {
+    diskWrite(() => writeFileSync(fileOf(sessionId), kept.map((e) => JSON.stringify(e)).join("\n") + "\n"));
+  }
+  return removed.size;
+}
+
+/** The session id to use upstream for a conversation: Claude Code's own, when the key is it. */
+export function stableSessionId(key: string): string | null {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(key)) return null;
+  // A client on this same machine already keeps a transcript under that id in
+  // ~/.claude/projects; the server CLI must not write (and the proxy then delete) it.
+  return localTranscriptExists(key) ? null : key;
+}
+
+function localTranscriptExists(sessionId: string): boolean {
+  const home = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  try {
+    const projects = join(home, "projects");
+    if (readdirSync(projects).some((dir) => existsSync(join(projects, dir, `${sessionId}.jsonl`)))) return true;
+  } catch {
+    /* no projects dir */
+  }
+  // A running CLI registers its session in ~/.claude/sessions/<pid>.json; the CLI refuses
+  // to start another one with that id ("Session ID ... is already in use").
+  try {
+    const dir = join(home, "sessions");
+    return readdirSync(dir).some((f) => f.endsWith(".json") && readFileSync(join(dir, f), "utf8").includes(sessionId));
+  } catch {
+    return false;
   }
 }
 

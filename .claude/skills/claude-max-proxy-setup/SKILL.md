@@ -235,6 +235,10 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
     - 工具结果里的 `tool_reference` 块原样转发（只转发这次请求里声明了的工具）。API 就靠它加载延迟工具，和直接用一样。
     - 客户端除了 tools 数组，还会在 system 消息里声明工具：MCP 工具以 `tool_addition` 块带完整定义，延迟工具只列名字。`withAnnouncedTools` 把这些都交给服务器 CLI：`tool_addition` 的定义注册成 MCP 工具；名单里的内置工具（CronList、Monitor、TaskCreate 等）直接启用 CLI 自己的定义，由服务器 CLI 自己做延迟加载。实测 Bun 抓包和直接用一致：`tool_result[tool_reference:CronList]`，下一个请求 tools 里出现 `CronList`（defer_loading），调用成功。
     - 仍然不同的一处：客户端的延迟工具列表（里面有只有名字、没有定义的客户端 MCP 工具）只能以提醒文本放在用户消息里转发，服务器 CLI 没法自己生成它。官方 CLI 在不支持 system 消息的模型和老版本上也是这样放的。
+22. **一个对话只用一个会话 ID**（直接用时，同一个对话里每个请求的 `x-claude-code-session-id` 和 `metadata.user_id.session_id` 都不变；以前代理每个工具轮次都分叉，导致会话 ID 每个请求都变）：
+    - 续接不再分叉：每轮工具调用结束后，`scrubDenials` 把钩子生成的拒绝记录（`PreToolUse:… hook error: Executed by the client.`）以及挂在它们后面的附加信息，从代理保存的会话记录里删掉。会话就停在工具调用上，下一个请求用 `resumeSessionAt`（上一轮最后一条回复）在同一个会话里接上真实结果。撤回也是在同一个会话里从检查点开分支，和直接用时撤回的做法一样。不清理的话，不分叉续接会把拒绝记录也带上去。
+    - 会话 ID：Claude Code 主对话直接用**客户端自己的会话 ID**，上游看到的和客户端直接登录时发出的完全一样。客户端就在本机时（`~/.claude/projects/*/<ID>.jsonl` 或 `~/.claude/sessions/*.json` 里已有这个 ID）改用新生成的 ID，否则 CLI 会报 "Session ID … is already in use"。第三方客户端和子代理在新建时生成一个，之后不变。
+    - 附带的好处：不再每轮复制一份整个会话，`data/sessions` 里一个对话只有一个文件。
 
 ## 同步上游更新
 
