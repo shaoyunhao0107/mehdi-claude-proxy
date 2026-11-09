@@ -18,6 +18,14 @@ $env:DATABASE_PATH = "$root\data\proxy.db"
 # Ollama is only for /v1/embeddings; a local address makes /health fail fast when it's absent.
 $env:OLLAMA_URL = "http://127.0.0.1:11434"
 $env:PATH = "$env:USERPROFILE\.local\bin;$env:ProgramFiles\nodejs;$env:PATH"
+# Working directory for the headless SDK when the client declares none (third-party /
+# OpenAI clients). It MUST be a plain directory OUTSIDE any git repo: the CLI attaches the
+# cwd's git status (uncommitted files, recent commit messages) to the upstream context, so
+# a cwd inside this proxy's own repo would leak "proxy-openai.log", commit subjects, etc. to
+# Anthropic. A neutral non-repo folder reports "Is a git repository: false" and leaks
+# nothing. Claude Code clients that mirror their own cwd are unaffected.
+$env:SDK_CWD = "$env:USERPROFILE\claude-workspace"
+New-Item -ItemType Directory -Force $env:SDK_CWD | Out-Null
 $node = (Get-Command node -ErrorAction Stop).Source
 $log = "$root\proxy.log"
 if ($Role -eq "openai") {
