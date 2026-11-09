@@ -149,3 +149,95 @@ test("an Anthropic error body becomes an OpenAI error with a mapped type", () =>
   assert.equal(b.error.code, "rate_limit_error");
   assert.equal(b.error.message, "slow down");
 });
+
+// --- Responses (/v1/responses) translation ------------------------------------------------
+import { translateResponsesRequest } from "../src/routes/openai/translateResponses.js";
+import { OpenAIResponsesResAdapter } from "../src/routes/openai/responsesAdapter.js";
+
+test("responses: instructions become system; input message maps to a user turn", () => {
+  const { body } = translateResponsesRequest({
+    model: "m",
+    instructions: "You are Codex.",
+    input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+  });
+  assert.equal(body.system, "You are Codex.");
+  assert.equal(body.messages[0].role, "user");
+  assert.deepEqual(body.messages[0].content, [{ type: "text", text: "hi" }]);
+});
+
+test("responses: function_call + function_call_output become tool_use / tool_result", () => {
+  const { body, clientTools } = translateResponsesRequest({
+    model: "m",
+    tools: [{ type: "function", name: "shell", description: "run", parameters: { type: "object", properties: {} } }],
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "ls" }] },
+      { type: "function_call", call_id: "c1", name: "shell", arguments: '{"cmd":"ls"}' },
+      { type: "function_call_output", call_id: "c1", output: "file.txt" },
+    ],
+  });
+  assert.equal(clientTools[0].name, "shell");
+  assert.equal((body.messages[1].content as Array<Record<string, unknown>>)[0].type, "tool_use");
+  assert.equal((body.messages[2].content as Array<Record<string, unknown>>)[0].type, "tool_result");
+});
+
+test("responses: a custom (apply_patch) tool is aliased and its freeform input carried", () => {
+  const { clientTools, aliases } = translateResponsesRequest({
+    model: "m",
+    tools: [{ type: "custom", name: "apply_patch", format: { syntax: "patch", definition: "*** Begin Patch" } }],
+    input: "x",
+  }) as never as { clientTools: Array<{ name: string; input_schema: Record<string, unknown> }>; aliases: Map<string, { kind: string }> };
+  assert.equal(clientTools[0].name, "apply_patch");
+  assert.equal(aliases.get("apply_patch")!.kind, "custom");
+});
+
+function fakeRes2() {
+  const state: { headers: Record<string, string>; chunks: string[]; json?: unknown; status: number } = { headers: {}, chunks: [], status: 200 };
+  const res = {
+    setHeader(k: string, v: string) { state.headers[k] = v; return res; },
+    flushHeaders() {}, status(c: number) { state.status = c; return res; },
+    json(b: unknown) { state.json = b; return res; },
+    write(s: string) { state.chunks.push(s); return true; }, end() { return res; }, on() { return res; },
+  };
+  return { res, state };
+}
+function aframes(evs: Array<[string, Record<string, unknown>]>): string[] {
+  return evs.map(([type, data]) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
+}
+
+test("responses non-stream: Anthropic message -> response object with a function_call item", () => {
+  const { res, state } = fakeRes2();
+  const aliases = new Map([["shell", { name: "shell", kind: "function" as const }]]);
+  const a = new OpenAIResponsesResAdapter(res as never, { responseId: "resp_x", model: "m", stream: false, created: 1, aliases, reasoningRequested: false });
+  a.json({ type: "message", role: "assistant", content: [{ type: "tool_use", id: "c1", name: "shell", input: { cmd: "ls" } }], stop_reason: "tool_use", usage: { input_tokens: 5, output_tokens: 2 } });
+  const b = state.json as { object: string; status: string; output: Array<Record<string, unknown>> };
+  assert.equal(b.object, "response");
+  assert.equal(b.output[0].type, "function_call");
+  assert.equal(b.output[0].name, "shell");
+  assert.equal(b.output[0].arguments, '{"cmd":"ls"}');
+});
+
+test("responses stream: emits created -> output_item -> completed with sequence numbers", () => {
+  const { res, state } = fakeRes2();
+  const aliases = new Map([["shell", { name: "shell", kind: "function" as const }]]);
+  const a = new OpenAIResponsesResAdapter(res as never, { responseId: "resp_y", model: "m", stream: true, created: 1, aliases, reasoningRequested: false });
+  a.flushHeaders();
+  for (const f of aframes([
+    ["message_start", { message: { usage: { input_tokens: 3 } } }],
+    ["content_block_start", { index: 0, content_block: { type: "tool_use", id: "c1", name: "shell" } }],
+    ["content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: '{"cmd":"ls"}' } }],
+    ["content_block_stop", { index: 0 }],
+    ["message_delta", { delta: { stop_reason: "tool_use" } }],
+    ["message_stop", {}],
+  ])) a.write(f);
+  a.end();
+  const events = state.chunks.filter((c) => c.startsWith("event:")).map((c) => c.split("\n")[0].slice(7));
+  assert.ok(events.includes("response.created"));
+  assert.ok(events.includes("response.output_item.added"));
+  assert.ok(events.includes("response.function_call_arguments.done"));
+  assert.ok(events.includes("response.completed"));
+  const datas = state.chunks.filter((c) => c.includes("data:")).map((c) => JSON.parse(c.split("data: ")[1]));
+  const seqs = datas.map((d) => d.sequence_number);
+  assert.deepEqual(seqs, [...seqs].sort((x, y) => x - y)); // monotonic
+  const completed = datas.find((d) => d.type === "response.completed");
+  assert.equal(completed.response.output[0].type, "function_call");
+});
