@@ -35,8 +35,14 @@ const INDEX = join(DIR, "conversations.json");
 const SID_RE = /^[0-9a-f-]{16,64}$/i;
 
 export interface ConversationState {
-  /** The CLI session that holds this conversation now (changes on every fork). */
+  /** The CLI session that holds this conversation now: the session id sent upstream. */
   sdkSessionId: string;
+  /**
+   * Where this conversation's transcript is kept, when that is not sdkSessionId: a
+   * subagent sends its parent's session id upstream (as a direct CLI does), so its own
+   * transcript needs another name in the store.
+   */
+  storeId?: string;
   /** Hashes of the client messages this state covers (the request that produced it). */
   msgHashes: string[];
   /** Set when the turn stopped at client tool calls: resume point and the awaited ids. */
@@ -59,6 +65,8 @@ const transcripts = new Map<string, SessionStoreEntry[]>(); // memory cache
 // ---------------- disk ----------------
 
 const fileOf = (sid: string) => join(DIR, `${sid}.jsonl`);
+/** The store name of a conversation's transcript. */
+export const storeIdOf = (st: Pick<ConversationState, "sdkSessionId" | "storeId">) => st.storeId ?? st.sdkSessionId;
 
 function diskWrite(fn: () => void): void {
   if (!PERSIST) return;
@@ -114,7 +122,7 @@ function loadFromDisk(): void {
     const rows = JSON.parse(readFileSync(INDEX, "utf8")) as Array<[string, ConversationState]>;
     const now = Date.now();
     for (const [key, st] of rows) {
-      if (st && SID_RE.test(st.sdkSessionId) && now - st.lastUsed <= IDLE_MS && existsSync(fileOf(st.sdkSessionId))) {
+      if (st && SID_RE.test(storeIdOf(st)) && now - st.lastUsed <= IDLE_MS && existsSync(fileOf(storeIdOf(st)))) {
         conversations.set(key, st);
       }
     }
@@ -122,7 +130,7 @@ function loadFromDisk(): void {
     /* no index yet */
   }
   // Remove transcripts nothing points at (rebuild seeds, sessions replaced by a fork).
-  const live = new Set([...conversations.values()].map((s) => s.sdkSessionId));
+  const live = new Set([...conversations.values()].map((s) => storeIdOf(s)));
   try {
     for (const f of readdirSync(DIR)) {
       const m = /^(.+)\.jsonl$/.exec(f);
@@ -140,7 +148,7 @@ setInterval(() => {
   const now = Date.now();
   for (const [key, st] of conversations) {
     if (now - st.lastUsed > IDLE_MS) forget(key);
-    else if (PERSIST && now - st.lastUsed > MEMORY_IDLE_MS) transcripts.delete(st.sdkSessionId);
+    else if (PERSIST && now - st.lastUsed > MEMORY_IDLE_MS) transcripts.delete(storeIdOf(st));
   }
 }, 10 * 60_000).unref();
 
@@ -168,6 +176,91 @@ export const memorySessionStore: SessionStore = {
     return fromDisk;
   },
 };
+
+/**
+ * The store for a run whose session id upstream differs from where its transcript is kept
+ * (a subagent on its parent's session id): the CLI reads and writes `sessionId`, the store
+ * keeps it under `storeId`.
+ */
+export function storeFor(sessionId: string, storeId: string): SessionStore {
+  if (sessionId === storeId) return memorySessionStore;
+  const map = <K extends { sessionId: string }>(key: K): K => (key.sessionId === sessionId ? { ...key, sessionId: storeId } : key);
+  return {
+    append: (key, entries) => memorySessionStore.append(map(key), entries),
+    load: (key) => memorySessionStore.load(map(key)),
+  };
+}
+
+/**
+ * The session id a direct CLI would send for a request of the Claude Code session `sid`:
+ * its subagents and tool-less side calls use the main conversation's session id. That is
+ * the id this proxy runs the main conversation under (the client's own id, normally), or,
+ * before the main conversation has started here, the client's id if it is free.
+ */
+export function sharedUpstreamId(sid: string): string | null {
+  return conversations.get(sid)?.sdkSessionId ?? planned.get(sid) ?? stableSessionId(sid);
+}
+
+// The id a main conversation's request was planned with, before its state is saved: the
+// client launches subagents as soon as the reply has streamed, while the proxy is still
+// draining the CLI, so they can arrive before saveConversation.
+const planned = new Map<string, string>();
+export function notePlannedId(key: string, id: string): void {
+  planned.delete(key);
+  planned.set(key, id);
+  while (planned.size > 500) planned.delete(planned.keys().next().value as string);
+}
+
+// A CLI started with a session id refuses to run when ~/.claude/projects/<cwd>/<id>.jsonl
+// exists, and a fresh session writes exactly that file. Fresh starts of one shared id
+// (parallel subagents) therefore go one at a time: remove the file (this proxy's own copy;
+// the store has the transcript), start, and let the next one go once the CLI is up.
+const freshStarts = new Map<string, Promise<void>>();
+export async function lockFreshStart(sid: string, maxMs = 20_000): Promise<() => void> {
+  const prev = freshStarts.get(sid) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((r) => (release = r));
+  const chained = prev.then(() => mine);
+  freshStarts.set(sid, chained);
+  await Promise.race([prev, new Promise((r) => setTimeout(r, maxMs).unref())]);
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    release();
+    if (freshStarts.get(sid) === chained) freshStarts.delete(sid);
+  };
+}
+
+// Fresh runs on a shared id that are running now. Their CLI keeps appending to the local
+// file until it exits (later requests resume and write elsewhere), so a start that was
+// refused waits for them instead of racing them again.
+const freshRuns = new Map<string, Set<Promise<void>>>();
+export function trackFreshRun(sid: string): () => void {
+  let done!: () => void;
+  const p = new Promise<void>((r) => (done = r));
+  const set = freshRuns.get(sid) ?? new Set<Promise<void>>();
+  set.add(p);
+  freshRuns.set(sid, set);
+  let ended = false;
+  return () => {
+    if (ended) return;
+    ended = true;
+    done();
+    set.delete(p);
+    if (set.size === 0 && freshRuns.get(sid) === set) freshRuns.delete(sid);
+  };
+}
+export async function freshRunsSettled(sid: string, maxMs: number): Promise<boolean> {
+  const deadline = Date.now() + maxMs;
+  for (;;) {
+    const set = freshRuns.get(sid);
+    if (!set || set.size === 0) return true;
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    await Promise.race([Promise.all([...set]), new Promise((r) => setTimeout(r, left).unref())]);
+  }
+}
 
 export function seedTranscript(sessionId: string, entries: SessionStoreEntry[]): void {
   transcripts.set(sessionId, entries);
@@ -252,7 +345,7 @@ export function dropTranscript(sessionId: string | undefined): void {
  * Conversation identity from Claude Code: metadata.user_id is a JSON string with the
  * CLI's session_id; an Agent-tool subagent shares it and adds x-claude-code-agent-id.
  */
-export function conversationKey(metadata: unknown, agentId: string | undefined): string | null {
+export function metadataSessionId(metadata: unknown): string | null {
   const raw = (metadata as { user_id?: unknown } | undefined)?.user_id;
   if (typeof raw !== "string") return null;
   let sid: unknown;
@@ -261,7 +354,12 @@ export function conversationKey(metadata: unknown, agentId: string | undefined):
   } catch {
     return null;
   }
-  if (typeof sid !== "string" || !SID_RE.test(sid)) return null;
+  return typeof sid === "string" && SID_RE.test(sid) ? sid : null;
+}
+
+export function conversationKey(metadata: unknown, agentId: string | undefined): string | null {
+  const sid = metadataSessionId(metadata);
+  if (!sid) return null;
   return agentId && /^[A-Za-z0-9_-]{1,128}$/.test(agentId) ? `${sid}:agent:${agentId}` : sid;
 }
 
@@ -310,14 +408,14 @@ export function getConversation(key: string): ConversationState | undefined {
 
 export function forget(key: string): void {
   const s = conversations.get(key);
-  if (s) dropTranscript(s.sdkSessionId);
+  if (s) dropTranscript(storeIdOf(s));
   if (conversations.delete(key)) saveIndexSoon();
 }
 
 /** Record the session that now holds the conversation; frees the one it replaced. */
 export function saveConversation(key: string, next: Omit<ConversationState, "lastUsed">): void {
   const prev = conversations.get(key);
-  if (prev && prev.sdkSessionId !== next.sdkSessionId) dropTranscript(prev.sdkSessionId);
+  if (prev && storeIdOf(prev) !== storeIdOf(next)) dropTranscript(storeIdOf(prev));
   conversations.delete(key); // re-insert: Map order = least recently used first
   conversations.set(key, { ...next, lastUsed: Date.now() });
   while (conversations.size > MAX_CONVERSATIONS) {

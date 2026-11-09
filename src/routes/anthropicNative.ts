@@ -40,7 +40,7 @@ import { dropWarm, takeWarm, warmKey, warmNext, warmSessionsEnabled, type WarmHa
 import { ensureSpare, prewarmEnabled, spareKey, takeSpare } from "../services/sparePool.js";
 import {
   awaitTurn, beginTurn, CONTINUITY_ENABLED, conversationKey, dropTranscript, fingerprintKey, forget, getConversation, memorySessionStore,
-  scrubDenials, stableSessionId,
+  scrubDenials, stableSessionId, storeFor, storeIdOf, sharedUpstreamId, lockFreshStart, metadataSessionId, notePlannedId, trackFreshRun, freshRunsSettled,
   messageHash, removeLocalTranscript, saveConversation, seedTranscript,
 } from "../services/conversationStore.js";
 import { cancelTask } from "../services/taskTracker.js";
@@ -208,6 +208,9 @@ function planTools(clientTools: ClientTool[]): ToolPlan {
 
 // The reason text of every denial (also how scrubDenials recognises them afterwards).
 const DENY_REASON = "Executed by the client.";
+// Subagents and tool-less side calls of a Claude Code session use the main conversation's
+// session id upstream, as in a direct CLI session (SHARE_SESSION_ID=false: own ids).
+const SHARE_SESSION_ID = process.env.SHARE_SESSION_ID !== "false";
 // Every tool call is denied before execution: the client runs it, never this server.
 const DENY_ALL_TOOLS: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
   PreToolUse: [
@@ -889,10 +892,21 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   ].map((t) => ({ type: "text", text: `<system-reminder>
 ${t}
 </system-reminder>` }));
-  const session = convKey
+  let session = convKey
     ? planSession(convKey, body.messages, msgHashes, plan.toUpstream, runCwd, p.resolvedModel, leadReminders, nopts)
     : null;
   if (DEBUG_CONTINUITY && convCandidate) console.log(`[session] ${p.messageId.slice(-6)} key=${convCandidate.slice(0, 8)} waited-ok=${!!convKey} plan=${session?.kind ?? "none"} resume=${session?.sessionId?.slice(0, 8)} at=${session?.resumeAt?.slice(0, 8)} msgs=${body.messages.length}`);
+
+  // Tool-less side calls of a Claude Code session (titles, summaries, ...) run stateless,
+  // but a direct CLI sends them with its session id: so do they here.
+  const metaSid = clientIsOfficial && !convKey && clientTools.length === 0 ? metadataSessionId(body.metadata) : null;
+  const sideSessionId = metaSid && SHARE_SESSION_ID ? sharedUpstreamId(metaSid) : null;
+  let shareRefused = false; // the CLI refused a shared id ("already in use"): own id
+  let shareRetried = false; // a subagent start retries the shared id once first
+  let sharedIdUsed = false;
+  let releaseFresh: (() => void) | null = null;
+  let endFreshRun: (() => void) | null = null;
+  let holdFreshLock = false; // a retried start keeps the lock for its whole run
 
   const acc: Acc = { blocks: [], partialJson: {}, stopReason: null, stopSequence: null, usage: {} };
   let started = false; // stream: message_start relayed
@@ -967,9 +981,21 @@ ${t}
       content = session.content; // planSession already put the lead reminders in
       systemPrompt = sysParts.join("\n\n") || undefined;
       extraOptions.persistSession = true;
-      extraOptions.sessionStore = memorySessionStore;
+      extraOptions.sessionStore = storeFor(session.sessionId, session.storeId);
       if (session.kind === "fresh") {
         extraOptions.sessionId = session.sessionId;
+        if (session.sessionId !== session.storeId) {
+          // A subagent starting on its parent's session id (see lockFreshStart).
+          sharedIdUsed = true;
+          const release = await lockFreshStart(session.sessionId);
+          releaseFresh = holdFreshLock ? null : release;
+          const endRun = trackFreshRun(session.sessionId);
+          endFreshRun = () => {
+            endRun();
+            release();
+          };
+          removeLocalTranscript(session.sessionId);
+        }
       } else {
         await ensureFreshToken(p.sdkCwd);
         extraOptions.resume = session.sessionId;
@@ -985,7 +1011,7 @@ ${t}
       systemPrompt = sysParts.join("\n\n") || undefined;
       if (history.length > 0) {
         await ensureFreshToken(p.sdkCwd);
-        const sessionId = randomUUID();
+        const sessionId = sideSessionId && !shareRefused ? sideSessionId : randomUUID();
         const entries = buildEntries(history, sessionId, runCwd, p.resolvedModel);
         extraOptions.resume = sessionId;
         extraOptions.persistSession = true; // required by sessionStore; writes go to the SDK's temp resume dir
@@ -993,6 +1019,9 @@ ${t}
           append: async () => {},
           load: async (key: { sessionId: string }) => (key.sessionId === sessionId ? entries : null),
         };
+      } else if (sideSessionId && !shareRefused) {
+        extraOptions.sessionId = sideSessionId; // not persisted: nothing written under it
+        sharedIdUsed = true;
       }
     } else {
       const single = body.messages.length === 1 && body.messages[0].role === "user";
@@ -1001,6 +1030,10 @@ ${t}
         : buildTranscriptBlocks(body.messages);
       systemPrompt = (single ? sysParts : [TRANSCRIPT_NOTE, ...sysParts]).join("\n\n") || undefined;
       if (SYSTEM_PROMPT_MODE === "official") content = [...reminderBlocks(single ? [] : [TRANSCRIPT_NOTE]), ...content];
+      if (sideSessionId && !shareRefused) {
+        extraOptions.sessionId = sideSessionId; // not persisted: nothing written under it
+        sharedIdUsed = true;
+      }
     }
     // Claude Code client whose cwd could not be mirrored (e.g. a Mac client on this Windows
     // server, or a drive letter this server lacks): restate the client's environment last
@@ -1093,6 +1126,9 @@ ${t}
     } finally {
       clearInterval(watchdog);
       releaseDenies();
+      releaseFresh?.();
+      endFreshRun?.();
+      endFreshRun = null;
     }
 
     async function consume(): Promise<void> {
@@ -1100,7 +1136,13 @@ ${t}
       lastActivity = Date.now();
       if (clientGone) break;
       const sid = (m as { session_id?: string }).session_id;
-      if (sid && (m.type === "system" || m.type === "result")) runSessionId = sid;
+      // A fresh session has written its local transcript file by the time its API call
+      // streams: only then may the next fresh start on the same id remove it and go.
+      if (m.type !== "system") releaseFresh?.();
+      if (sid && (m.type === "system" || m.type === "result")) {
+        runSessionId = sid;
+        if (audit) audit.upstream.sessionId = sid; // what the CLI sends as x-claude-code-session-id
+      }
       if (m.type === "assistant" && !m.parent_tool_use_id) lastAssistantUuid = (m as { uuid?: string }).uuid ?? lastAssistantUuid;
       if (finished) continue; // drain the rest so the request log completes
       if (m.type === "system" && (m as { subtype?: string }).subtype === "init") {
@@ -1243,6 +1285,44 @@ ${t}
       // Usage/rate limits (and models the plan lacks) fail the same way in any mode: report, don't retry.
       const limited = /hit your .{0,20}limit|usage limit|rate[ _]limit|overloaded|requires (usage )?credits/i.test(String((err as Error)?.message ?? ""));
       limitedError = limited;
+      releaseFresh?.();
+      endFreshRun?.();
+      endFreshRun = null;
+      const inUse = (e: unknown) =>
+        /already in use/i.test(`${(e as Error)?.message ?? ""} ${(e as { upstreamText?: string })?.upstreamText ?? ""}`);
+      if (inUse(err) && sharedIdUsed && !shareRefused && nothingSent && !clientGone) {
+        // The shared session id was refused (a sibling subagent's file appeared between
+        // removal and start): a subagent tries it once more, then runs under its own id.
+        for (;;) {
+          const again = !shareRetried && !!session && session.sessionId !== session.storeId;
+          console.warn(`[native] shared session id refused, retrying ${again ? "it once more" : "under an own id"}`);
+          sharedIdUsed = false;
+          if (again) {
+            // Wait until the sibling subagents' first requests are done (their CLIs stop
+            // writing the local file), then start alone: the lock is held for the whole run.
+            shareRetried = true;
+            holdFreshLock = true;
+            const settled = await freshRunsSettled(session!.sessionId, 20_000);
+            if (!settled) {
+              shareRefused = true;
+              session = { ...session!, sessionId: session!.storeId };
+            }
+          } else {
+            shareRefused = true;
+            if (session && session.sessionId !== session.storeId) session = { ...session, sessionId: session.storeId };
+          }
+          try {
+            await run(firstMode, false, false);
+            break;
+          } catch (err2) {
+            if (finished) break;
+            const quiet = !started && acc.blocks.length === 0 && !clientGone;
+            if (inUse(err2) && sharedIdUsed && !shareRefused && quiet) continue;
+            fail(err2);
+            break;
+          }
+        }
+      } else {
       if (session && convKey && !limited) {
         // The kept session is not trustworthy any more: forget it, rebuild next time.
         forget(convKey);
@@ -1261,6 +1341,7 @@ ${t}
       } else {
         fail(err);
       }
+      }
     }
   }
 
@@ -1272,13 +1353,15 @@ ${t}
       const toolIds = acc.blocks.filter((b) => b?.type === "tool_use").map((b) => b.id as string);
       // Earlier turns that this request builds on stay valid rewind points.
       const prev = getConversation(convKey);
-      const kept = session.basisN !== undefined ? (prev?.checkpoints ?? []).filter((c) => c.n <= session.basisN!) : [];
+      const basisN = session.basisN;
+      const kept = basisN !== undefined ? (prev?.checkpoints ?? []).filter((c) => c.n <= basisN) : [];
       const checkpoints = lastAssistantUuid
         ? [...kept, { n: msgHashes.length, uuid: lastAssistantUuid, pending: toolIds.length ? toolIds : undefined }].slice(-60)
         : kept;
       // saveConversation also frees the session this one forked from.
       saveConversation(convKey, {
         sdkSessionId: runSessionId,
+        storeId: session.storeId !== runSessionId ? session.storeId : undefined,
         msgHashes,
         checkpointUuid: toolIds.length ? lastAssistantUuid : undefined,
         pendingToolIds: toolIds.length ? toolIds : undefined,
@@ -1287,7 +1370,7 @@ ${t}
       });
       // The turn stopped at client tool calls: drop the synthetic denials, so the same
       // session continues with the real results (before any early start loads it).
-      if (toolIds.length) scrubDenials(runSessionId, DENY_REASON);
+      if (toolIds.length) scrubDenials(session.storeId, DENY_REASON);
       if (session.seededId && session.seededId !== runSessionId) dropTranscript(session.seededId);
       if (session.kind === "fresh") removeLocalTranscript(runSessionId);
       // Start the next request now: resume this session (at the tool-call entry, forking,
@@ -1296,7 +1379,7 @@ ${t}
         const x = (lastSessionParams.extraOptions ?? {}) as Record<string, unknown>;
         const nextExtra: Record<string, unknown> = {
           persistSession: true,
-          sessionStore: memorySessionStore,
+          sessionStore: storeFor(runSessionId, session.storeId),
           resume: runSessionId,
           ...(lastAssistantUuid ? { resumeSessionAt: lastAssistantUuid } : {}),
           ...(x.systemPrompt ? { systemPrompt: x.systemPrompt } : {}),
@@ -1329,8 +1412,10 @@ interface SessionPlan {
   kind: "fresh" | "continue" | "rewind" | "rebuild";
   /** continue/rewind: how many client messages of the kept session this request builds on. */
   basisN?: number;
-  /** fresh: the id to create; continue/rebuild: the session to resume. */
+  /** fresh: the id to create; continue/rebuild: the session to resume (the id upstream). */
   sessionId: string;
+  /** Where its transcript is kept (differs from sessionId for a subagent, see storeFor). */
+  storeId: string;
   resumeAt?: string;
   fork: boolean;
   content: Block[];
@@ -1373,6 +1458,7 @@ function planSession(
             kind: "continue",
             basisN: n,
             sessionId: st.sdkSessionId,
+            storeId: storeIdOf(st),
             resumeAt: pending.length ? st.checkpointUuid : st.tipUuid,
             fork: false,
             content: delta[0].content,
@@ -1398,7 +1484,7 @@ function planSession(
       if (!ok) continue;
       if (DEBUG_CONTINUITY) console.log(`[session] ${key.slice(0, 8)}: rewind to turn after ${c.n} message(s)`);
       // Like a direct CLI rewind: a new branch in the same session from that turn's reply.
-      return { kind: "rewind", basisN: c.n, sessionId: st.sdkSessionId, resumeAt: c.uuid, fork: false, content: delta[0].content };
+      return { kind: "rewind", basisN: c.n, sessionId: st.sdkSessionId, storeId: storeIdOf(st), resumeAt: c.uuid, fork: false, content: delta[0].content };
     }
     if (DEBUG_CONTINUITY) console.log(`[session] ${key.slice(0, 8)}: history does not extend the kept session, rebuilding`);
   }
@@ -1408,17 +1494,25 @@ function planSession(
   const content = all[all.length - 1].content;
   // One session id per conversation upstream: Claude Code's own session id when the key
   // is it (what the client would have sent itself), else the one already in use, else new.
-  const id = stableSessionId(key) ?? st?.sdkSessionId ?? randomUUID();
+  // A subagent (key "<sid>:agent:<id>") uses its parent's session id, as in a direct CLI
+  // session, and keeps its transcript under a name of its own.
+  const parent = SHARE_SESSION_ID ? /^(.+):agent:/.exec(key)?.[1] : undefined;
+  const id = parent
+    ? sharedUpstreamId(parent) ?? st?.sdkSessionId ?? randomUUID()
+    : stableSessionId(key) ?? st?.sdkSessionId ?? randomUUID();
+  const storeId = parent ? (st?.storeId && st.storeId !== id ? st.storeId : randomUUID()) : id;
+  if (!parent) notePlannedId(key, id);
   if (history.length === 0) {
-    dropTranscript(id); // a fresh start of this conversation: nothing earlier applies
-    return { kind: "fresh", sessionId: id, fork: false, content: [...lead, ...content] };
+    dropTranscript(storeId); // a fresh start of this conversation: nothing earlier applies
+    return { kind: "fresh", sessionId: id, storeId, fork: false, content: [...lead, ...content] };
   }
   if (lead.length) history[0] = { ...history[0], content: [...lead, ...history[0].content] };
   const entries = buildEntries(history, id, cwd, model);
-  seedTranscript(id, entries as Array<{ type: string; [k: string]: unknown }>);
+  seedTranscript(storeId, entries as Array<{ type: string; [k: string]: unknown }>);
   return {
     kind: "rebuild",
     sessionId: id,
+    storeId,
     resumeAt: entries[entries.length - 1].uuid as string,
     fork: false,
     content,

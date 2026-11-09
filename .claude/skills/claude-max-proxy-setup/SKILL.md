@@ -244,6 +244,12 @@ cat result.txt     # 应为 4818 和【客户端】的主机名，文件出现�
     - 每小时看一下 `~/.claude/.credentials.json` 的修改时间（只看时间，不读内容）。重新登录后一小时内就会刷新，不用等每天一次的定时刷新。也可以手动刷新：`POST /api/admin/models/refresh?full=1`（仅限本机）。
     - 新模型：`supportedModels()` 来自官方 CLI 的模型选择器，SDK 更新后新模型会自动出现，并且会探测下一个版本号。请求里的模型名不会被拦，客户端直接填新模型 ID 也能用。
     - 套餐不包含的模型（"requires usage credits"）返回 **402 billing_error**，以前返回 500，Claude Code 会重试最多 10 次。也不再退回 transcript 模式重试，上游只发一次。
+24. **子代理和附带小请求也用主对话的会话 ID**（2026-11-09。直接使用时，子代理的请求带父会话的 ID 外加 `x-claude-code-agent-id`；生成标题之类不带工具的小请求也带父会话的 ID。以前代理给每个子代理和每个小请求都新开一个 ID）：
+    - 子代理（会话键 `<sid>:agent:<id>`）发给上游的会话 ID 用 `sharedUpstreamId(父 sid)`。查找顺序：主对话已保存的 ID，然后是主对话请求规划时记下的 ID（`notePlannedId`；客户端在主回复流完就发子代理请求，这时代理还没保存状态），最后是 `stableSessionId`。子代理自己的会话记录存在另一个名字下（`ConversationState.storeId`，通过 `storeFor(sessionId, storeId)` 映射）。所有清理和改写操作（drop、seed、scrub、forget、磁盘恢复）用的都是 storeId，绝不能用共享 ID，否则会删掉父对话的记录。
+    - CLI 用 `--session-id X` 新建会话时，如果 `~/.claude/projects/<cwd>/X.jsonl` 已存在，会报 "already in use"。而新建会话的第一个请求正好会写这个文件（后续请求都是续接，写到临时目录）。所以子代理新建会话时要先拿 `lockFreshStart`，删掉这个文件（这是代理自己的副本），等 CLI 开始流式返回后再放锁。如果还是被拒（并行的兄弟子代理还在写这个文件），就用 `freshRunsSettled` 等兄弟的第一个请求跑完，最多等 20 秒，然后独占锁再试一次。再不行就改用自己的 ID。实测：家里 3 个并行子代理经 Magpie，9 个请求全部是客户端自己的会话 ID；其中一个子代理的第一个请求因为等待多花了约 5 秒。
+    - 不带工具的小请求（transcript 或 native 模式，无状态）：设 `sessionId` 为主对话的 ID，`persistSession:false`，不写任何文件。带历史的 native 小请求用这个 ID 作为 resume 的 ID。
+    - 审计日志的 `upstream.sessionId` 记录 CLI 实际发出的会话 ID，验证时看这一项。设 `SHARE_SESSION_ID=false` 可以退回旧行为（各用各的 ID）。
+    - 试过但不行：resume 一个只有 session-owner 记录、没有消息的会话，CLI 会报 "No conversation found"。
 
 ## 同步上游更新
 
