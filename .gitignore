@@ -42,4 +42,4 @@ secrets/
 # Local runtime secrets / logs
 .admin-secret
 .home-key
-proxy.log
+proxy*.log*
