@@ -241,3 +241,19 @@ test("responses stream: emits created -> output_item -> completed with sequence 
   const completed = datas.find((d) => d.type === "response.completed");
   assert.equal(completed.response.output[0].type, "function_call");
 });
+
+// --- gateway line scrub (Magpie "powered by ... · <url>") -------------------------------
+import { __test as native } from "../src/routes/anthropicNative.js";
+
+test("the gateway 'powered by ... · <url>' line is scrubbed from the client prompt", () => {
+  const sysIn = "This conversation is powered by Claude Sonnet 5.5 · http://120.24.95.52:3457\n\nYou are DeskPal, a work assistant. Be concise.";
+  const out = native.scrubGatewayLines(sysIn);
+  assert.ok(!out!.includes("powered by"), "powered-by line removed");
+  assert.ok(!out!.includes("120.24.95.52"), "proxy URL removed");
+  assert.ok(out!.startsWith("You are DeskPal"), "the real prompt is kept");
+});
+
+test("scrub leaves a normal prompt untouched and respects the off switch", () => {
+  assert.equal(native.scrubGatewayLines("You are Claude Code."), "You are Claude Code.");
+  assert.equal(native.scrubGatewayLines(undefined), undefined);
+});

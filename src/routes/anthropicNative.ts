@@ -349,6 +349,25 @@ function systemText(system: NativeBody["system"]): string | undefined {
   return t || undefined;
 }
 
+// Lines a gateway prepends to the client's system prompt that identify the relay or the
+// provider endpoint — e.g. Magpie's "This conversation is powered by <model> · <url>",
+// which names the proxy's own address. The client's system prompt is forwarded upstream
+// (as a reminder), so these would otherwise reveal the relay to Anthropic. They are the
+// gateway's, not the client's, and carry no instruction the model needs. Patterns are
+// anchored to the start of a line; GATEWAY_LINE_PATTERNS (|| -separated) can add more.
+const GATEWAY_LINE_RES: RegExp[] = [
+  /^This conversation is powered by [^\n]*\n+/i,
+  ...(process.env.GATEWAY_LINE_PATTERNS
+    ? process.env.GATEWAY_LINE_PATTERNS.split("||").map((p) => new RegExp(p, "i"))
+    : []),
+];
+function scrubGatewayLines(text: string | undefined): string | undefined {
+  if (!text || process.env.SCRUB_GATEWAY_LINES === "false") return text;
+  let out = text;
+  for (const re of GATEWAY_LINE_RES) out = out.replace(re, "");
+  return out.trimStart() || undefined;
+}
+
 /**
  * The client's own "# Environment" section (cwd, platform, shell...), latest occurrence,
  * from its system prompt, role:"system" turns or reminder text. The CLI always attaches
@@ -439,7 +458,9 @@ function officialPromptBody(system: NativeBody["system"]): string | undefined {
   const kept = parts
     .map((t) => t.split("\n").filter((l, i) => !(i === 0 && l.startsWith("x-anthropic-billing-header:"))).join("\n"))
     .filter((t) => t.trim() && !IDENTITY_LINE_RE.test(t.trim()) && !t.trim().startsWith("x-anthropic-billing-header:"));
-  return kept.join("\n\n") || undefined;
+  // Also drop a gateway "powered by ... · <url>" line if one was prepended to an official
+  // client's prompt (e.g. home Claude Code routed through Magpie).
+  return scrubGatewayLines(kept.join("\n\n")) || undefined;
 }
 
 function previewOf(messages: Msg[]): string {
@@ -854,7 +875,9 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
     return;
   }
 
-  const clientSystem = systemText(body.system);
+  // Drop any gateway-injected identification line (Magpie's "powered by ... · <url>")
+  // before the prompt is used anywhere, so it never reaches upstream.
+  const clientSystem = scrubGatewayLines(systemText(body.system));
   // A Claude Code client's own (official) system prompt.
   const clientIsOfficial = !!clientSystem && LOOKS_OFFICIAL.test(clientSystem.slice(0, 400));
   const clientEnv = clientIsOfficial ? clientEnvironment(body.messages, clientSystem) : null;
@@ -1547,4 +1570,4 @@ function planSession(
 }
 
 /** Internals for the unit tests in tests/ (not used by the server). */
-export const __test = { planSession, normalize };
+export const __test = { planSession, normalize, scrubGatewayLines };
