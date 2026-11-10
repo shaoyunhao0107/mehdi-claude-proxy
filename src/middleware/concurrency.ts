@@ -5,7 +5,8 @@
 import type { Request, Response, NextFunction } from "express";
 
 const MAX = Math.max(1, parseInt(process.env.MAX_CONCURRENT_REQUESTS || "4", 10));
-const LIMITED = /^\/(messages|chat\/completions)$/;
+// Every route that starts a CLI process, /responses (Codex) included.
+const LIMITED = /^\/(messages|chat\/completions|responses)$/;
 
 let running = 0;
 const waiting: Array<() => void> = [];

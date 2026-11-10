@@ -103,6 +103,7 @@ export class OpenAIChatResAdapter {
 
   write(chunk: string): boolean {
     // Streaming path: handleNative writes Anthropic SSE frames "event: X\ndata: {...}\n\n".
+    if (this.closed) return false;
     this.begin();
     this.sseBuffer += chunk;
     let i: number;
@@ -216,8 +217,16 @@ export class OpenAIChatResAdapter {
         break;
       }
       case "message_stop": {
+        this.chunk({}, this.finish ?? "stop");
+        // As OpenAI sends it with stream_options.include_usage: one last chunk that
+        // carries the usage and no choices.
         const usage = this.opt.includeUsage ? usageBlock(this.usage) : undefined;
-        this.chunk({}, this.finish ?? "stop", usage);
+        if (usage) {
+          this.real.write(`data: ${JSON.stringify({
+            id: this.opt.id, object: "chat.completion.chunk", created: this.opt.created, model: this.opt.model,
+            choices: [], usage,
+          })}\n\n`);
+        }
         break;
       }
       case "error": {
@@ -266,6 +275,7 @@ export class OpenAIChatResAdapter {
       this.real.write(`data: ${JSON.stringify({ error: toOpenAIError(err) })}\n\n`);
       if (this.opt.stream) this.real.write("data: [DONE]\n\n");
       this.real.end();
+      this.closed = true; // a later end() must not write to the ended response
       return;
     }
     this.realHeadersSent = true;

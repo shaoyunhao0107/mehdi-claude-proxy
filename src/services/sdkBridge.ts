@@ -8,6 +8,22 @@ import { attachUpstreamText } from "./errorClassifier.js";
 
 const STDERR_TAIL_CHARS = 4000;
 
+/**
+ * Permission rules that refuse every call of the CLI's shell, file and fetch tools. They
+ * hold in bypass mode and leave the request unchanged: measured on CLI 2.1.322, system
+ * prompt, tool definitions and first message are byte-identical with and without them
+ * (`Bash(**)` keeps Bash listed, where `Bash(*)` would remove it). Write and NotebookEdit
+ * follow the Edit rules, Glob and Grep the Read rules.
+ */
+export const EXECUTION_DENY_RULES: readonly string[] = [
+  "Bash(**)",
+  "Edit(**)",
+  "Edit(//**)",
+  "Read(**)",
+  "Read(//**)",
+  "WebFetch(domain:*)",
+];
+
 /** Everything that decides the CLI's options (and so which prewarmed spare fits). */
 export interface SdkOptionParams {
   resolvedModel: string;
@@ -96,6 +112,13 @@ export function buildSdkOptions(params: SdkOptionParams): Record<string, unknown
   if (params.mcpServers) sdkOptions.mcpServers = params.mcpServers;
   if (params.allowedTools) sdkOptions.allowedTools = params.allowedTools;
   if (params.disallowedTools) sdkOptions.disallowedTools = params.disallowedTools;
+  // Client-side tool runs (a PreToolUse hook hands every call to the client) with the
+  // CLI's own built-ins enabled: those are real tools on this server, kept from running
+  // only by that hook. The rules are a second barrier for a hook that failed.
+  const handsToolsToClient = !!(params.extraOptions?.hooks as { PreToolUse?: unknown } | undefined)?.PreToolUse;
+  if (handsToolsToClient && Array.isArray(params.builtInTools) && params.builtInTools.length > 0) {
+    sdkOptions.disallowedTools = [...(params.disallowedTools ?? []), ...EXECUTION_DENY_RULES];
+  }
   if (params.permissionMode) sdkOptions.permissionMode = params.permissionMode;
   if (params.cwd) sdkOptions.cwd = params.cwd;
   // Local patch: default to NO built-in tools. The SDK default is the full Claude Code

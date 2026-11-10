@@ -127,7 +127,13 @@ test("stream: Anthropic SSE becomes OpenAI chunks, tool args assemble, ends with
   assert.ok(state.chunks.includes("data: [DONE]\n\n"));
   const parsed = state.chunks.filter((c) => c.startsWith("data: {")).map((c) => JSON.parse(c.slice(6)));
   let text = "", args = "", finish: string | null = null, name = "";
+  const usageChunks = parsed.filter((o) => o.choices.length === 0);
+  assert.equal(usageChunks.length, 1); // usage rides alone on the last chunk, as OpenAI sends it
+  assert.deepEqual(usageChunks[0].usage, { prompt_tokens: 4, completion_tokens: 7, total_tokens: 11, prompt_tokens_details: { cached_tokens: 0 } });
+  assert.equal(parsed[parsed.length - 1], usageChunks[0]);
   for (const o of parsed) {
+    if (o.choices.length === 0) continue;
+    assert.equal(o.usage, undefined);
     const d = o.choices[0].delta;
     if (d.content) text += d.content;
     for (const tc of d.tool_calls ?? []) { if (tc.function?.name) name = tc.function.name; if (tc.function?.arguments) args += tc.function.arguments; }

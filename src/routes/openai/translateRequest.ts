@@ -52,6 +52,22 @@ function partsToAnthropic(content: unknown): string | Json[] {
   return blocks;
 }
 
+/** The text of a string or of the text parts of a content array. */
+function textOfContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return content == null ? "" : JSON.stringify(content);
+  const texts: string[] = [];
+  let other = false;
+  for (const part of content as Json[]) {
+    if (part && (part.type === "text" || part.type === "input_text" || part.type === "output_text") && typeof part.text === "string") texts.push(part.text);
+    else other = true;
+  }
+  // Parts that are not text (rare here) are kept as JSON rather than dropped.
+  return other && texts.length === 0 ? JSON.stringify(content) : texts.join("\n");
+}
+
+const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+
 function toolChoice(choice: unknown): NativeBody["tool_choice"] {
   if (choice === "none") return { type: "none" };
   if (choice === "required") return { type: "any" };
@@ -70,15 +86,16 @@ export function translateChatRequest(raw: OpenAIChatBody): TranslatedChat {
   for (const msg of raw.messages ?? []) {
     const role = msg.role as string;
     if (role === "system" || role === "developer") {
-      const c = msg.content;
-      systemTexts.push(typeof c === "string" ? c : JSON.stringify(c));
+      const text = textOfContent(msg.content);
+      if (text) systemTexts.push(text);
       continue;
     }
     if (role === "assistant") {
       const toolCalls = msg.tool_calls as Json[] | undefined;
       if (toolCalls && toolCalls.length) {
         const blocks: Json[] = [];
-        if (typeof msg.content === "string" && msg.content) blocks.push({ type: "text", text: msg.content });
+        const said = textOfContent(msg.content);
+        if (said) blocks.push({ type: "text", text: said });
         for (const tc of toolCalls) {
           const fn = (tc.function as Json) ?? {};
           let input: Json = {};
@@ -99,7 +116,7 @@ export function translateChatRequest(raw: OpenAIChatBody): TranslatedChat {
       const block: Json = {
         type: "tool_result",
         tool_use_id: msg.tool_call_id as string,
-        content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content ?? ""),
+        content: textOfContent(msg.content),
       };
       const last = messages[messages.length - 1];
       if (last && last.role === "user" && Array.isArray(last.content) && (last.content[0] as Json)?.type === "tool_result") {
@@ -133,6 +150,12 @@ export function translateChatRequest(raw: OpenAIChatBody): TranslatedChat {
   if (systemTexts.length) body.system = systemTexts.join("\n\n");
   const tc = toolChoice(raw.tool_choice);
   if (tc) body.tool_choice = tc;
+  // reasoning_effort asks for reasoning at that depth: thinking on, effort as given.
+  // "none" / "minimal" (and no value) leave thinking off, as before.
+  if (typeof raw.reasoning_effort === "string" && EFFORTS.has(raw.reasoning_effort)) {
+    body.thinking = { type: "adaptive" };
+    body.output_config = { effort: raw.reasoning_effort };
+  }
 
   return {
     body,

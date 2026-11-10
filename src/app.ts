@@ -20,22 +20,24 @@ app.use(healthRoutes);
 // Admin API — protected by admin secret
 app.use("/api/admin", adminApiRoutes);
 
-// /v1/* routes — protected by API key auth + budget check + rate limiting
-// Local patch: then a cap on concurrently running model requests (one CLI process each).
-app.use("/v1", apiKeyAuth, concurrencyLimit);
-// OpenAI protocol layer (new): translate OpenAI -> Anthropic and run through the hardened
-// core. Mounted only in the OpenAI role (ENABLE_OPENAI_LAYER), and BEFORE the legacy
-// proxyRoutes so it takes precedence on /v1/chat/completions. In the Anthropic role it is
-// absent, so that deployment is unchanged.
-if (OPENAI_LAYER_ENABLED) {
-  app.use("/v1", apiKeyAuth, budgetCheckMiddleware, rateLimitMiddleware, openaiLayerRoutes);
-}
+// /v1/* routes: API key auth, budget check and rate limiting, then a cap on concurrently
+// running model requests (one CLI process each). The chain is mounted ONCE. Mounting it
+// per router ran it again for every router a request fell through: /v1/messages was
+// counted twice against its key's requests-per-minute (three times in the OpenAI role),
+// /v1/embeddings up to four times, and the key was validated (a database write) each time.
+// Rejections come before the concurrency cap, so a refused request never waits for a slot.
+app.use("/v1", apiKeyAuth, budgetCheckMiddleware, rateLimitMiddleware, concurrencyLimit);
+// OpenAI protocol layer: translate OpenAI -> Anthropic and run through the hardened core.
+// Mounted only in the OpenAI role (ENABLE_OPENAI_LAYER), and BEFORE the legacy proxyRoutes
+// so it takes precedence on /v1/chat/completions. In the Anthropic role it is absent, so
+// that deployment is unchanged.
+if (OPENAI_LAYER_ENABLED) app.use("/v1", openaiLayerRoutes);
 // OpenAI-compatible (legacy): GET /v1/models, POST /v1/chat/completions (tools run on server)
-app.use("/v1", apiKeyAuth, budgetCheckMiddleware, rateLimitMiddleware, proxyRoutes);
+app.use("/v1", proxyRoutes);
 // Native Anthropic Messages: POST /v1/messages
-app.use("/v1", apiKeyAuth, budgetCheckMiddleware, rateLimitMiddleware, anthropicRoutes);
+app.use("/v1", anthropicRoutes);
 // Embeddings: POST /v1/embeddings (proxied to Ollama)
-app.use("/v1", apiKeyAuth, budgetCheckMiddleware, rateLimitMiddleware, embeddingsRoutes);
+app.use("/v1", embeddingsRoutes);
 
 // Centralized error handler
 app.use(errorHandler);

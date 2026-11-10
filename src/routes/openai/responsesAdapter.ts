@@ -290,6 +290,7 @@ export class OpenAIResponsesResAdapter {
     if (this.realHeadersSent) {
       this.emit("response.failed", { response: this.envelope("failed", { error: toResponsesError(err) }) });
       this.real.end();
+      this.closed = true; // a later end() must not write to the ended response
       return;
     }
     this.realHeadersSent = true;

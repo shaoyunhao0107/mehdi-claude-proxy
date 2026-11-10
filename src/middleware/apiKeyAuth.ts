@@ -19,6 +19,8 @@ declare global {
   }
 }
 
+const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+
 // Which response format to use for auth errors.
 // Anthropic routes (/messages, /messages/count_tokens) get Anthropic-style errors;
 // everything else gets OpenAI-style (so openai SDK clients can parse them).
@@ -66,9 +68,20 @@ export function apiKeyAuth(req: Request, res: Response, next: NextFunction): voi
     return;
   }
 
-  // If no keys exist yet, allow all requests (backward compatible)
+  // No keys yet: only this machine may use the proxy. Without this, a fresh install
+  // reachable from the network serves the logged-in subscription to anyone who finds
+  // the port. AUTH_DISABLED=true (handled above) is the explicit way to run open.
   if (!hasAnyKeys()) {
-    next();
+    if (LOOPBACK.has(req.socket?.remoteAddress || "")) {
+      next();
+      return;
+    }
+    sendAuthError(
+      req,
+      res,
+      "No API key is configured, so only requests from the proxy's own machine are accepted. " +
+        "Create a key in the admin dashboard, or set AUTH_DISABLED=true to allow everyone."
+    );
     return;
   }
 
