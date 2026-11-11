@@ -6,7 +6,7 @@ import type { AddressInfo } from "net";
 import { app } from "../src/app.js";
 import { createApiKey, updateApiKey } from "../src/services/apiKeyService.js";
 import { db } from "../src/db/connection.js";
-import { buildSdkOptions, EXECUTION_DENY_RULES } from "../src/services/sdkBridge.js";
+import { buildSdkOptions } from "../src/services/sdkBridge.js";
 import { translateChatRequest } from "../src/routes/openai/translateRequest.js";
 import { OpenAIChatResAdapter } from "../src/routes/openai/resAdapter.js";
 import { apiKeyAuth } from "../src/middleware/apiKeyAuth.js";
@@ -80,21 +80,16 @@ test("the concurrency cap covers /responses", () => {
   assert.equal(concurrencyStatus().running, before);
 });
 
-test("client-run built-ins get the execution rules; other runs are left alone", () => {
+test("client-run built-ins get no permission rules and no permission mode", () => {
+  // A rule on a file tool runs before the PreToolUse hook and would hide the call from the
+  // client. The CLI's default permission mode is what refuses a call the hook missed.
   const hooks = { PreToolUse: [{ hooks: [async () => ({})] }] };
-  const guarded = buildSdkOptions({ resolvedModel: "m", builtInTools: ["Bash", "Read"], extraOptions: { hooks } });
-  assert.deepEqual(guarded.disallowedTools, [...EXECUTION_DENY_RULES]);
-  assert.deepEqual(guarded.tools, ["Bash", "Read"]);
-
-  const merged = buildSdkOptions({ resolvedModel: "m", builtInTools: ["Bash"], disallowedTools: ["WebSearch"], extraOptions: { hooks } });
-  assert.deepEqual(merged.disallowedTools, ["WebSearch", ...EXECUTION_DENY_RULES]);
-
-  // Tools the server is meant to run itself (no handing-over hook): untouched.
-  assert.equal(buildSdkOptions({ resolvedModel: "m", builtInTools: ["Bash"] }).disallowedTools, undefined);
-  // No built-ins: nothing to guard.
-  assert.equal(buildSdkOptions({ resolvedModel: "m", extraOptions: { hooks } }).disallowedTools, undefined);
-  // None of the rules is a whole-tool rule, which would remove the tool from the request.
-  for (const rule of EXECUTION_DENY_RULES) assert.doesNotMatch(rule, /^\w+(\(\*\))?$/);
+  const options = buildSdkOptions({ resolvedModel: "m", builtInTools: ["Bash", "Read", "Write"], extraOptions: { hooks } });
+  assert.equal(options.disallowedTools, undefined);
+  assert.equal(options.permissionMode, undefined);
+  assert.equal(options.allowDangerouslySkipPermissions, undefined);
+  assert.deepEqual(options.tools, ["Bash", "Read", "Write"]);
+  assert.deepEqual(buildSdkOptions({ resolvedModel: "m", disallowedTools: ["WebSearch"], extraOptions: { hooks } }).disallowedTools, ["WebSearch"]);
 });
 
 test("content arrays give their text to system, assistant and tool turns", () => {

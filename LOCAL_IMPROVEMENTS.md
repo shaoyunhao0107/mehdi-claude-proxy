@@ -20,13 +20,14 @@ Not pushed. Each item has a test in `tests/hardening.test.ts` or `tests/openai.t
 - **No API key configured: only this machine is served.** Before, a fresh install that was
   reachable from the network served the logged-in subscription to anyone until the first
   key was created. `AUTH_DISABLED=true` remains the explicit way to run open.
-- **Second barrier for client-run built-in tools.** With the CLI's own `Bash`, `Read`,
-  `Edit`… enabled, only the PreToolUse hook kept a call from running on this server (a
-  call without that hook does run: measured). Permission rules now refuse those calls as
-  well (`EXECUTION_DENY_RULES` in `src/services/sdkBridge.ts`). Measured on CLI 2.1.322:
-  system prompt, tool definitions and first message are byte-identical with and without
-  the rules. **Not covered:** `PowerShell` (the Windows server's shell tool) and
-  `WebSearch`; the rule form for PowerShell could not be checked on macOS.
+- **Client-run built-in tools: what stops a call the hook missed.** With the CLI's own
+  `Bash`, `Read`, `Edit`… enabled, the PreToolUse hook hands every call to the client. If
+  the hook did not act, the CLI's default permission mode refuses the call, because nobody
+  can be asked (measured on CLI 2.1.322 for Bash, Write, Read and WebFetch with no hook
+  installed). The native path leaves that mode in place, and a test now pins it.
+  An earlier version of this branch added permission rules (`Edit(**)`, `Read(**)`…) as a
+  second barrier. **That was wrong and is removed:** a rule on a file tool is applied
+  before the hook, so the hook never saw the call and the client never received it.
 - **Admin secret compared in constant time.**
 
 ## OpenAI layer
