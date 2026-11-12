@@ -91,6 +91,16 @@ client writing and reading a file, and from another machine through a gateway: 1
 checks over its three provider types, Claude Code 2.1.321 and Codex 0.167 creating files on
 their own machine.
 
+## Installing on macOS or Linux
+
+`scripts/serve.sh install [--port 3457]` builds a fresh clone, runs the proxy as a service
+(launchd or systemd), creates the first API key through the admin API and prints the key
+and the addresses: this machine, each local-network address, and the address the internet
+sees (looked up without a proxy and tried from this machine). `info`, `restart`, `stop`,
+`uninstall` and `logs` do what they say. Run on macOS from a fresh clone: install, a chat
+over the local-network address with the key, restart, uninstall. The systemd path has not
+been run. On Windows, `scripts/install-windows.ps1`.
+
 ## Looked at and left alone
 
 - The legacy `/v1/chat/completions` in `src/routes/proxy.ts` (with its "You are NOT Claude
