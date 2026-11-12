@@ -6,7 +6,7 @@ services:
     build: .
     container_name: claudeproxy-app
     environment:
-      - PORT=3456
+      - PORT=3457
       - DATABASE_PATH=/app/data/proxy.db
       - ADMIN_API_SECRET=${ADMIN_API_SECRET}
       # Token can now be set via admin UI (Settings page) instead of env var.
@@ -16,7 +16,7 @@ services:
     volumes:
       - app-data:/app/data
     ports:
-      - "127.0.0.1:9026:3456"
+      - "127.0.0.1:9026:3457"
     restart: unless-stopped
 
   admin:
@@ -27,7 +27,7 @@ services:
       - NEXTAUTH_URL=https://${DOMAIN}
       - ADMIN_USER=${ADMIN_USER}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-      - INTERNAL_API_URL=http://app:3456
+      - INTERNAL_API_URL=http://app:3457
       - ADMIN_API_SECRET=${ADMIN_API_SECRET}
     ports:
       - "127.0.0.1:9027:3000"

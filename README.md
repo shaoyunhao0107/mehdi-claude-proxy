@@ -31,7 +31,7 @@ The Claude Code Agent SDK authenticates via OAuth tokens from a Claude Pro/Max s
                                  +-----------------+
   OpenAI SDK / Cursor / etc. --->|                 |---> Claude Code Agent SDK ---> Claude
                                  |  Express Server |
-  Anthropic SDK / HTTP --------->|  (port 3456)    |---> Ollama (local embeddings)
+  Anthropic SDK / HTTP --------->|  (port 3457)    |---> Ollama (local embeddings)
                                  |                 |
                                  +-----------------+
                                         |
@@ -82,7 +82,7 @@ npm run dev
 cd admin && npm run dev
 ```
 
-The API is now available at `http://localhost:3456` and the admin dashboard at `http://localhost:3000/admin`.
+The API is now available at `http://localhost:3457` and the admin dashboard at `http://localhost:3000/admin`.
 
 > **Note:** You can set the Claude token either as the `CLAUDE_CODE_OAUTH_TOKEN` environment variable or through the admin dashboard Settings page after startup.
 
@@ -110,7 +110,7 @@ This starts four containers: the Express API server, Next.js admin, nginx revers
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `PORT` | No | `3456` | Server port |
+| `PORT` | No | `3457` | Server port |
 | `DATABASE_PATH` | No | `./data/proxy.db` | SQLite database path |
 | `ADMIN_API_SECRET` | Yes | | Shared secret for admin API authentication |
 | `AUTH_DISABLED` | No | `false` | Set to `true` to disable API key checks |
@@ -127,7 +127,7 @@ This starts four containers: the Express API server, Next.js admin, nginx revers
 | `NEXTAUTH_URL` | Yes | | Dashboard URL (e.g., `http://localhost:3000/admin`) |
 | `ADMIN_USER` | Yes | | Admin login username |
 | `ADMIN_PASSWORD` | Yes | | Admin login password |
-| `INTERNAL_API_URL` | No | `http://localhost:3456` | Express server URL (internal) |
+| `INTERNAL_API_URL` | No | `http://localhost:3457` | Express server URL (internal) |
 | `ADMIN_API_SECRET` | Yes | | Must match the Express server value |
 
 ### Docker Compose (`.env`)

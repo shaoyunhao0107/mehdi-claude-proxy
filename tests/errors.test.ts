@@ -22,3 +22,9 @@ test("auth and unknown errors", () => {
   assert.equal(cls("OAuth token has expired. Please run /login").status, 401);
   assert.equal(cls("something new and strange").status, 500);
 });
+
+test("an unknown model is a 404, in the CLI's own words", () => {
+  const c = cls("Claude Code returned an error result: There's an issue with the selected model (no-such-model). It may not exist or you may not have access to it. Run --model to pick a different model.");
+  assert.equal(c.status, 404);
+  assert.equal(c.type, "not_found_error");
+});

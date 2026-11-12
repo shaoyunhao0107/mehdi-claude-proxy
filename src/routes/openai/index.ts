@@ -1,14 +1,17 @@
 // OpenAI protocol layer — router.
 //
-// Mounted only when ENABLE_OPENAI_LAYER is set (the 3458 "OpenAI backup" role). When it is
-// not set (the 3457 Anthropic role), this router is never registered, so that deployment
-// behaves exactly as before. Endpoints translate to/from the hardened Anthropic core.
+// Mounted by default, so one instance serves /v1/messages, /v1/chat/completions and
+// /v1/responses through the same hardened core. ENABLE_OPENAI_LAYER=false leaves it out
+// and restores the legacy /v1/chat/completions. Endpoints translate to/from the core.
 import { Router } from "express";
 import type { Request, Response } from "express";
 import { handleChatCompletions } from "./chatCompletions.js";
 import { handleResponses } from "./responses.js";
 
-export const OPENAI_LAYER_ENABLED = process.env.ENABLE_OPENAI_LAYER === "1" || process.env.ENABLE_OPENAI_LAYER === "true";
+// On unless ENABLE_OPENAI_LAYER is "0" or "false". It used to be opt-in, which left
+// /v1/chat/completions on the legacy handler (tools run on this server, its own system
+// prompt) and /v1/responses missing unless a second instance was started for it.
+export const OPENAI_LAYER_ENABLED = process.env.ENABLE_OPENAI_LAYER !== "0" && process.env.ENABLE_OPENAI_LAYER !== "false";
 
 const router = Router();
 

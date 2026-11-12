@@ -1,7 +1,7 @@
 import { mkdirSync } from "fs";
 import { dirname } from "path";
 
-export const PORT = parseInt(process.env.PORT || "3456");
+export const PORT = parseInt(process.env.PORT || "3457");
 
 // Local patch: the CLI subprocesses inherit ANTHROPIC_BASE_URL. Pointing it at this proxy
 // itself (easy to do when a client's env leaks into the service's) makes every request

@@ -1,4 +1,4 @@
-const INTERNAL_API_URL = process.env.INTERNAL_API_URL || "http://localhost:3456";
+const INTERNAL_API_URL = process.env.INTERNAL_API_URL || "http://localhost:3457";
 const ADMIN_API_SECRET = process.env.ADMIN_API_SECRET || "";
 
 async function adminFetch(path: string, options?: RequestInit): Promise<Response> {

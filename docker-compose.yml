@@ -2,7 +2,7 @@ services:
   app:
     build: .
     environment:
-      - PORT=3456
+      - PORT=3457
       - DATABASE_PATH=/app/data/proxy.db
       - ADMIN_API_SECRET=${ADMIN_API_SECRET}
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
@@ -10,7 +10,7 @@ services:
     volumes:
       - app-data:/app/data
     expose:
-      - "3456"
+      - "3457"
     restart: unless-stopped
 
   admin:
@@ -20,7 +20,7 @@ services:
       - NEXTAUTH_URL=https://${DOMAIN}
       - ADMIN_USER=${ADMIN_USER}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-      - INTERNAL_API_URL=http://app:3456
+      - INTERNAL_API_URL=http://app:3457
       - ADMIN_API_SECRET=${ADMIN_API_SECRET}
     expose:
       - "3000"

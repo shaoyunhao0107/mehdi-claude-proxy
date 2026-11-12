@@ -53,11 +53,20 @@ interface TrackedQueryParams extends SdkOptionParams {
   warm?: { query: { query(prompt: string | AsyncIterable<SDKUserMessage>): Query }; stderrSink: { fn?: (d: string) => void } };
 }
 
-// Local patch: env applied to every SDK subprocess. Skips the session-title call,
-// the /api/hello probe and telemetry, so a request costs exactly one API call.
+// Local patch: env applied to every SDK subprocess, so a request costs exactly one API
+// call and nothing of this server's own setup reaches it.
+//
+// CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC and DISABLE_TELEMETRY are NOT set (they were).
+// With either one the CLI does not load its remote feature flags, and the request it
+// builds differs from an ordinary one: other system prompt text, a shorter anthropic-beta
+// list and a <total_tokens> reminder (measured with scripts/compare-upstream.mjs).
+// CLAUDE_CODE_DISABLE_TERMINAL_TITLE turns off the one side call those two also
+// suppressed, the session title, and leaves the conversation request byte-identical.
+// QUIET_UPSTREAM=true brings the old pair back.
+const LEGACY_QUIET = process.env.QUIET_UPSTREAM === "true";
 const QUIET_ENV: Record<string, string> = {
-  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
-  DISABLE_TELEMETRY: "1",
+  ...(LEGACY_QUIET ? { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_TELEMETRY: "1" } : {}),
+  CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
   DISABLE_ERROR_REPORTING: "1",
   // The official preset would otherwise attach this server's own auto-memory / org memory.
   CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",

@@ -139,3 +139,35 @@ test("after a mid-stream error the adapter writes nothing more", () => {
   assert.ok(writes.some((w) => w.includes('"code":"overloaded_error"')));
   assert.equal(writes[writes.length - 1], "data: [DONE]\n\n");
 });
+
+test("the thinking filter drops thinking blocks and renumbers the rest", async () => {
+  const { thinkingFilter } = await import("../src/routes/anthropicNative.js");
+  const f = thinkingFilter();
+  const events = [
+    { type: "message_start", message: {} },
+    { type: "content_block_start", index: 0, content_block: { type: "thinking" } },
+    { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "hm" } },
+    { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "s" } },
+    { type: "content_block_stop", index: 0 },
+    { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "hi" } },
+    { type: "content_block_stop", index: 1 },
+    { type: "content_block_start", index: 2, content_block: { type: "redacted_thinking" } },
+    { type: "content_block_stop", index: 2 },
+    { type: "content_block_start", index: 3, content_block: { type: "tool_use", id: "t", name: "f" } },
+    { type: "content_block_stop", index: 3 },
+    { type: "message_delta", delta: { stop_reason: "tool_use" } },
+    { type: "message_stop" },
+  ];
+  const out = events.map((e) => f(e)).filter(Boolean) as Array<{ type: string; index?: number }>;
+  assert.deepEqual(out.map((e) => [e.type, e.index]), [
+    ["message_start", undefined],
+    ["content_block_start", 0], ["content_block_delta", 0], ["content_block_stop", 0],
+    ["content_block_start", 1], ["content_block_stop", 1],
+    ["message_delta", undefined], ["message_stop", undefined],
+  ]);
+  // A stream without thinking passes through untouched.
+  const g = thinkingFilter();
+  const plain = { type: "content_block_start", index: 0, content_block: { type: "text" } };
+  assert.equal(g(plain), plain);
+});

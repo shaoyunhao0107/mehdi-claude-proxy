@@ -72,7 +72,9 @@ export function classifyUpstreamError(err: unknown, now: Date = new Date()): Cla
     };
   }
 
-  if (/not_found_error|\bmodel not found\b|\b404\b/i.test(haystack)) {
+  // "There's an issue with the selected model (x). It may not exist or you may not have
+  // access to it." is how the CLI words an unknown model: the client's mistake, not a 500.
+  if (/not_found_error|\bmodel not found\b|\b404\b|issue with the selected model/i.test(haystack)) {
     return { status: 404, type: "not_found_error", message };
   }
 

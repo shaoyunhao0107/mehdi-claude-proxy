@@ -22,8 +22,8 @@ RUN npm ci --omit=dev
 
 COPY --from=build /app/dist/ ./dist/
 
-ENV PORT=3456
-EXPOSE 3456
+ENV PORT=3457
+EXPOSE 3457
 
 VOLUME /app/data
 

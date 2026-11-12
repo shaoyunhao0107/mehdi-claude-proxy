@@ -38,5 +38,5 @@ The SDK's `query()` returns an `AsyncGenerator<SDKMessage>`. The message types t
 
 ## Environment
 
-- `PORT` — server port (default: `3456`)
+- `PORT` — server port (default: `3457`)
 - The server requires a valid Claude Code / Anthropic API authentication (inherited from the environment where Claude Code CLI is authenticated)

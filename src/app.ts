@@ -28,9 +28,8 @@ app.use("/api/admin", adminApiRoutes);
 // Rejections come before the concurrency cap, so a refused request never waits for a slot.
 app.use("/v1", apiKeyAuth, budgetCheckMiddleware, rateLimitMiddleware, concurrencyLimit);
 // OpenAI protocol layer: translate OpenAI -> Anthropic and run through the hardened core.
-// Mounted only in the OpenAI role (ENABLE_OPENAI_LAYER), and BEFORE the legacy proxyRoutes
-// so it takes precedence on /v1/chat/completions. In the Anthropic role it is absent, so
-// that deployment is unchanged.
+// On by default (ENABLE_OPENAI_LAYER=false leaves it out), and mounted BEFORE the legacy
+// proxyRoutes so it takes precedence on /v1/chat/completions.
 if (OPENAI_LAYER_ENABLED) app.use("/v1", openaiLayerRoutes);
 // OpenAI-compatible (legacy): GET /v1/models, POST /v1/chat/completions (tools run on server)
 app.use("/v1", proxyRoutes);

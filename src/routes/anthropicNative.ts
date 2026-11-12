@@ -505,6 +505,36 @@ function mapEffort(oc: unknown): string | undefined {
   return typeof e === "string" && ["low", "medium", "high", "xhigh", "max"].includes(e) ? e : undefined;
 }
 
+const DEFAULT_THINKING = process.env.DEFAULT_THINKING === "off" ? "off" : "cli";
+// THIRD_PARTY_CHAT_CONTINUITY=false: tool-less and non-streamed requests of clients other
+// than Claude Code are stateless again.
+const THIRD_PARTY_CHAT_CONTINUITY = process.env.THIRD_PARTY_CHAT_CONTINUITY !== "false";
+
+/**
+ * Drops the thinking blocks from an upstream event stream and renumbers the blocks
+ * that remain, so a client that did not ask for thinking gets a gapless stream.
+ */
+export function thinkingFilter(): (ev: Block) => Block | null {
+  const clientIndex = new Map<number, number>();
+  const hidden = new Set<number>();
+  let next = 0;
+  return (ev) => {
+    if (typeof ev.index !== "number") return ev;
+    const upstream = ev.index;
+    if (ev.type === "content_block_start") {
+      const type = (ev.content_block as Block | undefined)?.type;
+      if (type === "thinking" || type === "redacted_thinking") {
+        hidden.add(upstream);
+        return null;
+      }
+      clientIndex.set(upstream, next++);
+    }
+    if (hidden.has(upstream)) return null;
+    const mapped = clientIndex.get(upstream);
+    return mapped === undefined || mapped === upstream ? ev : { ...ev, index: mapped };
+  };
+}
+
 // ---------------- native mode: real session history ----------------
 
 interface NMsg {
@@ -923,10 +953,19 @@ export async function handleNative(req: Request, res: Response, p: NativeParams)
   // one real CLI session across requests and sends only what is new.
   // Claude Code is identified by its session id; other clients (WorkBuddy, Cherry, or a
   // gateway that drops metadata) by a fingerprint of their first message.
+  //
+  // The "tools and streamed" condition exists for Claude Code, whose tool-less and
+  // non-streamed requests are side calls (titles, summaries) that share the main loop's
+  // session id and must not touch its session. Another client has no such side calls: a
+  // plain chat is its conversation. Keeping that stateless re-sent the whole history as a
+  // new session on every turn, so nothing of it was ever read from the prompt cache
+  // (measured: 2082 of 23403 tokens cached on the second turn of a long chat).
+  const mainLoopShape = clientTools.length > 0 && p.stream;
   const convCandidate =
-    CONTINUITY_ENABLED && clientTools.length > 0 && p.stream && last?.role === "user"
-      ? (clientIsOfficial ? conversationKey(body.metadata, req.header("x-claude-code-agent-id") ?? undefined) : null)
-        ?? fingerprintKey(req.apiKeyId, body.messages)
+    CONTINUITY_ENABLED && last?.role === "user"
+      ? clientIsOfficial
+        ? (mainLoopShape ? conversationKey(body.metadata, req.header("x-claude-code-agent-id") ?? undefined) ?? fingerprintKey(req.apiKeyId, body.messages) : null)
+        : (mainLoopShape || THIRD_PARTY_CHAT_CONTINUITY ? fingerprintKey(req.apiKeyId, body.messages) : null)
       : null;
   // Wait for this conversation's previous request to save its state (see awaitTurn);
   // if it is still running after that, this request stays stateless.
@@ -969,6 +1008,17 @@ ${t}
       cancelTask(p.messageId);
     }
   });
+
+  // DEFAULT_THINKING: what goes upstream when the client's request names no thinking.
+  //  - "cli" (default): nothing is set, so the CLI sends what it sends for any session
+  //    (thinking on). Setting it to disabled changed four items of the request against an
+  //    ordinary one: thinking, temperature, context_management and the anthropic-beta list
+  //    (measured with scripts/compare-upstream.mjs). The client did not ask for thinking,
+  //    so the thinking blocks are left out of what it receives.
+  //  - "off": thinking disabled, as before. Saves the thinking tokens.
+  const clientThinking = body.thinking && typeof body.thinking === "object" ? (body.thinking as { type?: string }).type : undefined;
+  const hideThinking = DEFAULT_THINKING === "cli" && clientThinking !== "adaptive" && clientThinking !== "enabled";
+  const visibleEvent = thinkingFilter();
 
   const finishNonStream = () => {
     responded = true;
@@ -1114,7 +1164,9 @@ ${t}
       systemPrompt,
       maxTurns: 1,
       cwd: runCwd,
-      thinking: mapThinking(body.thinking, p.resolvedModel, body.max_tokens),
+      // A client that did not ask for thinking: the CLI's own default goes upstream (see
+      // DEFAULT_THINKING), and the thinking it produces is kept from the client below.
+      thinking: hideThinking ? undefined : mapThinking(body.thinking, p.resolvedModel, body.max_tokens),
       effort: mapEffort(body.output_config),
       extraEnv,
       extraOptions,
@@ -1216,7 +1268,9 @@ ${t}
       }
       if (m.type !== "stream_event" || m.parent_tool_use_id) continue;
 
-      const ev = { ...(m.event as Block) };
+      const relayed = hideThinking ? visibleEvent(m.event as Block) : (m.event as Block);
+      if (!relayed) continue;
+      const ev = { ...relayed };
       if (ev.type === "message_start") {
         ev.message = { ...(ev.message as Block), id: p.messageId, model: p.resolvedModel };
       } else if (ev.type === "content_block_start" && (ev.content_block as Block)?.type === "tool_use") {
